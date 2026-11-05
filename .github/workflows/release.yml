@@ -20,10 +20,16 @@ jobs:
         with:
           lfs: true
       - name: Archive models
+        shell: bash
         run: |
           set -euo pipefail
-          tar -czf face-models.tar.gz models
-          shasum -a 256 face-models.tar.gz > face-models.tar.gz.sha256
+          # models/ 体积大，被 .gitignore 排除，CI 检出时通常不存在 → 不阻塞 Release
+          if [ -d models ]; then
+            tar -czf face-models.tar.gz models
+            shasum -a 256 face-models.tar.gz > face-models.tar.gz.sha256
+          else
+            echo "::warning::models/ 未纳入 git（见 .gitignore），跳过模型包"
+          fi
       - name: Upload models artifact
         uses: actions/upload-artifact@v4
         with:
@@ -31,7 +37,7 @@ jobs:
           path: |
             face-models.tar.gz
             face-models.tar.gz.sha256
-          if-no-files-found: error
+          if-no-files-found: ignore
           retention-days: 1
 
   build:
@@ -104,8 +110,22 @@ jobs:
           rmdir C:\opencv\opencv-4.10.0 /s /q
           rmdir C:\opencv\opencv_contrib-4.10.0 /s /q
 
+      # 守卫：go.mod 里绝不允许出现本机绝对路径的 replace（曾因 /tmp/gocv_patched 导致构建失败）
+      - name: Guard go.mod against local replaces
+        shell: bash
+        run: |
+          if grep -qE '^[[:space:]]*replace[[:space:]]+.*=>[[:space:]]*/' go.mod; then
+            echo "::error::go.mod 中含有绝对路径 replace，请先执行 ./scripts/restore-gocv.sh 并提交干净的 go.mod"
+            grep -nE '^[[:space:]]*replace' go.mod
+            exit 1
+          fi
+
       - name: Prepare patched gocv
-        run: ./scripts/patch-gocv.sh
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./scripts/patch-gocv.sh
+          grep -nE 'gocv\.io/x/gocv' go.mod
 
       - name: Build vi
         env:
@@ -113,15 +133,24 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
         run: |
+          mkdir -p dist/bin
           go build -tags importface -trimpath -ldflags "-s -w -X main.Version=${{ github.ref_name }}" -o dist/bin/vi${{ matrix.os == 'windows' && '.exe' || '' }} .
+
+      # 无论构建成败都恢复 go.mod，避免脏 go.mod 被带到下一步/被提交
+      - name: Restore go.mod
+        if: always()
+        shell: bash
+        run: ./scripts/restore-gocv.sh || true
 
       - name: Bundle OpenCV DLLs (Windows)
         if: matrix.os == 'windows'
+        shell: bash
         run: cp /c/opencv/build/install/x64/mingw/bin/*.dll dist/bin/
 
       - name: Download qdrant
         env:
           QDRANT_VERSION: ${{ env.QDRANT_VERSION }}
+        shell: bash
         run: |
           set -euo pipefail
           os="${{ matrix.os }}"
@@ -150,6 +179,7 @@ jobs:
           chmod +x dist/bin/qdrant || true
 
       - name: Assemble package
+        shell: bash
         run: |
           set -euo pipefail
           PKG="vi-${{ github.ref_name }}-${{ matrix.os }}-${{ matrix.arch }}"
@@ -162,10 +192,18 @@ jobs:
           for f in haarcascade_frontalface_default.xml haarcascade_frontalface_alt.xml haarcascade_frontalface_alt2.xml haarcascade_eye.xml haarcascade_smile.xml; do
             curl -fsSL "$base/$f" -o "dist/$PKG/models/haarcascades/$f"
           done
+          # YuNet DNN 人脸检测模型：优先用 git 内置副本，缺失则从 opencv_zoo 下载兜底
+          if [ -f models/face_detection_yunet_2023mar.onnx ]; then
+            cp models/face_detection_yunet_2023mar.onnx "dist/$PKG/models/"
+          else
+            curl -fsSL "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx" \
+              -o "dist/$PKG/models/face_detection_yunet_2023mar.onnx"
+          fi
           if [ -f start.sh ]; then cp start.sh "dist/$PKG/"; fi
           rm -f "dist/$PKG/scripts/package.sh"
 
       - name: Archive package
+        shell: bash
         run: |
           set -euo pipefail
           cd dist

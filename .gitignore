@@ -3,14 +3,20 @@
 *.exe
 *.test
 
+# 构建中间目录（含 patched gocv，禁止提交）
+/.build/
+
 # 运行时数据（全排除）
 /data/
 .qdrant-initialized
 
 # AI 模型（进 GitHub Release，不进 git）
-/models/
+/models/*
 *.onnx
 *.task
+
+# 例外：YuNet 检测模型仅 232KB，进 git 供 CI 发布包携带
+!/models/face_detection_yunet_2023mar.onnx
 
 # MediaPipe / ORT WASM 也较大，进 Release
 /web/vendor/ort/*.wasm
