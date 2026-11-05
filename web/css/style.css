@@ -162,10 +162,10 @@ h2 { font-size: 15px; margin: 0 0 12px; color: var(--text); }
 .chip.bad .dot { background: var(--danger); }
 .chip.warn .dot { background: var(--warn); }
 
-.stats-row { display: flex; gap: 6px; flex-shrink: 0; }
-.stat { flex: 1 1 0; min-width: 0; background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 6px 8px; text-align: center; }
-.stat .num { font-size: 18px; font-weight: 700; color: var(--accent); line-height: 1.1; }
-.stat .lbl { color: var(--muted); font-size: 11px; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.stats-row { display: flex; gap: 8px; flex-shrink: 0; }
+.stat { flex: 1 1 0; min-width: 0; background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 6px 10px; display: flex; align-items: center; justify-content: center; gap: 6px; }
+.stat .num { font-size: 14px; font-weight: 700; color: var(--accent); line-height: 1; }
+.stat .lbl { color: var(--muted); font-size: 13px; line-height: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
 .feed { flex: 1 1 auto; min-height: 0; overflow: auto; display: grid; gap: 10px; align-content: start; }
 .feed-item {
