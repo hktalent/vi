@@ -114,6 +114,24 @@ h2 { font-size: 14px; margin: 0 0 8px; color: var(--text); }
   position: absolute; inset: 0; display: grid; place-items: center;
   color: var(--muted); text-align: center; padding: 20px;
 }
+/* stage 右上角浮动状态层：chipCamera + liveMsg，不占布局空间 */
+.stage-hud {
+  position: absolute; top: 8px; right: 8px; z-index: 10;
+  display: flex; align-items: center; gap: 6px;
+  padding: 4px 8px;
+  background: rgba(0,0,0,0.55);
+  border-radius: 18px;
+  backdrop-filter: blur(4px);
+  font-size: 11px;
+  color: #eee;
+  pointer-events: none;  /* 不挡鼠标事件 */
+}
+.stage-hud .chip { background: transparent; border-color: rgba(255,255,255,0.3); color: #fff; }
+.stage-hud .muted { color: rgba(255,255,255,0.8); }
+/* 手机端 hud 小一点 */
+@media (max-width: 600px) {
+  .stage-hud { top: 6px; right: 6px; padding: 3px 6px; font-size: 10px; gap: 4px; }
+}
 
 .toolbar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 6px; flex-shrink: 0; }
 

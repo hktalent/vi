@@ -25,14 +25,16 @@
           <video id="video" autoplay playsinline muted></video>
           <canvas id="overlay" class="overlay"></canvas>
           <div class="empty" id="emptyTip">点击「启动摄像头」开始采集<br /><span class="muted">需要浏览器摄像头权限，建议在 127.0.0.1 或 HTTPS 下访问</span></div>
+          <div class="stage-hud" id="stageHud">
+            <span class="chip" id="chipCamera"><span class="dot"></span>摄像头未启动</span>
+            <span class="muted" id="liveMsg">未启动</span>
+          </div>
         </div>
       </section>
 
       <section class="panel status-panel" id="statusPanel">
         <div class="status-row">
           <div class="toolbar">
-            <span class="chip" id="chipCamera"><span class="dot"></span>摄像头未启动</span>
-            <span class="muted" id="liveMsg" style="font-size:11px;">未启动</span>
             <label class="cam-pick">
               <span class="muted">视频设备</span>
               <select class="select" id="selCamera" title="选择摄像头">
