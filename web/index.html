@@ -27,35 +27,35 @@
           <div class="empty" id="emptyTip">点击「启动摄像头」开始采集<br /><span class="muted">需要浏览器摄像头权限，建议在 127.0.0.1 或 HTTPS 下访问</span></div>
           <div class="stage-hud" id="stageHud">
             <span class="chip" id="chipCamera"><span class="dot"></span>摄像头未启动</span>
-            <span class="muted" id="liveMsg">未启动</span>
+            <span class="muted" id="liveMsg"></span>
           </div>
+        </div>
+        <div class="toolbar">
+          <label class="cam-pick">
+            <span class="muted">视频设备</span>
+            <select class="select" id="selCamera" title="选择摄像头">
+              <option value="">默认摄像头</option>
+            </select>
+          </label>
+          <button class="btn" id="btnRefreshCam" title="重新枚举摄像头">刷新</button>
+          <button class="btn primary" id="btnStart">启动</button>
+          <button class="btn" id="btnStop" disabled>停止</button>
+          <button class="btn" id="btnBeep">鸣叫</button>
         </div>
       </section>
 
       <section class="panel status-panel" id="statusPanel">
         <div class="status-row">
-          <div class="toolbar">
-            <label class="cam-pick">
-              <span class="muted">视频设备</span>
-              <select class="select" id="selCamera" title="选择摄像头">
-                <option value="">默认摄像头</option>
-              </select>
-            </label>
-            <button class="btn" id="btnRefreshCam" title="重新枚举摄像头">刷新</button>
-            <button class="btn primary" id="btnStart">启动</button>
-            <button class="btn" id="btnStop" disabled>停止</button>
-            <button class="btn" id="btnBeep">鸣叫</button>
+          <div class="chips" style="flex:1;">
+            <span class="chip" id="chipQdrant"><span class="dot"></span>Qdrant</span>
+            <span class="chip" id="chipFace"><span class="dot"></span>人脸模型</span>
+            <span class="chip" id="chipPlate"><span class="dot"></span>车牌模型</span>
+            <span class="chip" id="chipGeo"><span class="dot"></span>定位</span>
           </div>
           <button class="btn small collapse-btn" id="btnCollapseStatus" title="收起状态栏">运行状态 ⟩</button>
           <button class="status-mini" id="statusMini" title="展开状态栏">运行状态</button>
         </div>
         <div class="status-body">
-        <div class="chips" style="margin-bottom: 10px;">
-          <span class="chip" id="chipQdrant"><span class="dot"></span>Qdrant</span>
-          <span class="chip" id="chipFace"><span class="dot"></span>人脸模型</span>
-          <span class="chip" id="chipPlate"><span class="dot"></span>车牌模型</span>
-          <span class="chip" id="chipGeo"><span class="dot"></span>定位</span>
-        </div>
         <h2>定位</h2>
         <div class="note" id="geoText">尚未获取定位；未定位时仍会采集，但地址与经纬度为空。</div>
         <h2 style="margin-top: 14px;">链路</h2>

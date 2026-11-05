@@ -80,14 +80,17 @@ a:hover { text-decoration: underline; }
   gap: 14px;
 }
 
-/* panel: flex column 让内部元素（.stage / .feed / .status-body）各自滚动 */
+/* panel: flex column 让内部元素各自滚动/排列 */
 .panel {
-  display: flex; flex-direction: column; min-height: 0; overflow: hidden;
+  display: flex; flex-direction: column; min-height: 0;
   background: var(--panel);
   border: 1px solid var(--line);
   border-radius: var(--radius);
   padding: 8px 10px;
 }
+/* 视频 panel: 两元素，stage 16:9 自适应，toolbar 紧贴底部 */
+.panel:first-child .stage { flex: 0 0 auto; }  /* stage 保持 aspect-ratio，不被 flex 拉伸 */
+.panel:first-child .toolbar { flex: 0 0 auto; } /* toolbar 紧贴底部 */
 .panel h2 { flex-shrink: 0; margin: 0 0 6px; }
 
 .grid { display: grid; gap: 10px; }
@@ -133,21 +136,18 @@ h2 { font-size: 14px; margin: 0 0 8px; color: var(--text); }
   .stage-hud { top: 6px; right: 6px; padding: 3px 6px; font-size: 10px; gap: 4px; }
 }
 
-.toolbar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 6px; flex-shrink: 0; }
-
-/* 运行状态内联：文字 + chip 一行，和按钮/选择器并列 */
-.status-inline { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); white-space: nowrap; padding: 0 4px; }
+.toolbar { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; margin-top: 6px; flex-shrink: 0; }
 
 .cam-pick { display: flex; align-items: center; gap: 4px; }
 .cam-pick span { font-size: 11px; white-space: nowrap; }
-.cam-pick .select { max-width: 200px; padding: 5px 8px; font-size: 12px; }
+.cam-pick .select { max-width: 160px; padding: 5px 6px; font-size: 11px; }
 
+/* 手机端 toolbar 更紧凑，但不强制某个按钮独占一行 */
 @media (max-width: 560px) {
-  .cam-pick { width: 100%; }
-  .cam-pick .select { flex: 1; max-width: none; min-width: 0; }
-  .toolbar .btn { flex: 1 1 auto; }
-  #btnStart { flex: 1 1 100%; order: -1; }
-  .toolbar .chip { flex: 1 1 100%; justify-content: center; }
+  .toolbar { gap: 3px; }
+  .toolbar .btn { padding: 4px 8px; font-size: 11px; }
+  .cam-pick span { display: none; }  /* 手机窄屏隐藏"视频设备"文字 */
+  .cam-pick .select { max-width: 120px; }
 }
 
 .btn {
