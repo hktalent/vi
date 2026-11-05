@@ -60,18 +60,27 @@ const Auth = {
     if (/^https?:\/\//i.test(path)) return path;
     // 规范化相对路径，确保不带前导 /
     let rel = path.replace(/^\/media\//, '').replace(/^\//, '');
-    try {
-      const r = await fetch('/api/media-url?path=' + encodeURIComponent(rel), {
-        headers: this._headers()
-      });
-      if (r.ok) {
-        const j = await r.json();
-        return j.url; // 形如 /media/xxx.jpg?sig=xxx&exp=xxx
-      }
-    } catch (e) { /* 忽略，fallback */ }
-    // Fallback：没登录或接口失败 → 退回用主 token query（但不推荐）
+    // 优先：已登录 → 调 /api/media-url 拿签名 URL
+    if (this.token) {
+      try {
+        const r = await fetch('/api/media-url?path=' + encodeURIComponent(rel), {
+          headers: this._headers()
+        });
+        if (r.ok) {
+          const j = await r.json();
+          return j.url; // 形如 /media/xxx.jpg?sig=xxx&exp=xxx
+        }
+      } catch (e) { /* 网络错误继续 fallback */ }
+    }
+    // Fallback：签名 URL 拿不到时 → 用主 token 做 query 参数（兼容后端 tokenFromHeader 的 query 兜底）
+    // 主 token 24h 有效，比签名 URL 更久但也更容易泄露（当前 15min 签名没拿到时的降级）
     let url = '/media/' + rel;
-    if (this.token) url += '?token=' + encodeURIComponent(this.token);
+    if (this.token) {
+      url += '?token=' + encodeURIComponent(this.token);
+    } else {
+      // 真的没登录 → 也拼上 token= 让后端 401（而不是 fallback 成无 token URL 直接 401 让 img 显示坏图）
+      url += '?token='; // 空 token → 后端 authenticate 失败 → 401
+    }
     return url;
   },
   _headers(extra = {}) {

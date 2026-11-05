@@ -130,13 +130,12 @@ function attrText(a) {
 }
 
 // 推理队列 worker：串行处理 inferQueue 中的 track（ORT WASM 不支持跨 session 并发）
-// 推理完 embedding + attrs 后立即尝试上传，然后取下一个
+// 推理完 embedding + attrs 后**立即**上传（不卡 6s，6s 只防旁路重复）
 function ensureInferWorker() {
   if (state.inferWorkerRunning) return;
   state.inferWorkerRunning = true;
   (async () => {
     while (state.inferQueue.length > 0) {
-      // 取出最早入队的 track（先进先出）
       const track = state.inferQueue.shift();
       if (!track) continue;
       // track 已消失（超过 1.5s 没被看到），跳过
@@ -146,13 +145,16 @@ function ensureInferWorker() {
         track.embedding = embedding;
         const attrs = await state.face.attributes(track._snap);
         if (attrs) track.attrs = attrs;
-        // 推理结束立即尝试上传（页面切后台时 rAF 会停，不等下次检测帧）
-        const t = performance.now();
-        if (track.embedding && t - track.lastSent > 6000) {
-          track.lastSent = t;
+        // 推理完立即上传——不卡 6s 防抖，推理本身已经 ~8s 足够冷却
+        if (track.embedding) {
+          track.lastSent = performance.now();
           await uploadFace(state.face.crop(video, track.box), track.embedding, track.attrs);
         }
-      } catch (e) { console.warn('face infer worker', e); }
+      } catch (e) {
+        console.warn('face infer worker', e);
+        // 出错也设置 lastSent，避免 faceLoop 旁路立即再试（给 3s 冷却）
+        track.lastSent = performance.now();
+      }
       track.inferring = false;
     }
     state.inferWorkerRunning = false;
