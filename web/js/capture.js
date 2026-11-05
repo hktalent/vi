@@ -185,15 +185,17 @@ function ensureInferWorker() {
   })();
 }
 
-// 人脸循环：rAF 驱动，FaceLandmarker 每 2 帧跑一次（中间帧由 MediaPipe 跟踪器衔接）；
+// 人脸循环：rAF 驱动，FaceLandmarker 每 N 帧跑一次（中间帧由 MediaPipe 跟踪器衔接）；
 // embedding+属性合并推理按 track 低频（3s）排队串行执行；上传按 track 防抖（≥6s）。
+// iOS Safari: 每 3 帧一次（省 CPU，WKWebView 不允许长时间主线程阻塞）
 let faceFrame = 0;
+const FACE_FRAME_SKIP = window._isIOSSafari ? 3 : 2;
 async function faceLoop() {
   if (!state.running) return;
   requestAnimationFrame(faceLoop);
   if (state.busyFace || !state.face || !video.videoWidth) return;
   faceFrame++;
-  if (faceFrame % 2 !== 0) return;
+  if (faceFrame % FACE_FRAME_SKIP !== 0) return;
   state.busyFace = true;
   try {
     const faces = await state.face.detect(video, performance.now());
@@ -399,25 +401,31 @@ async function start() {
 async function openCamera() {
   const sel = document.getElementById('selCamera');
   const devId = sel && sel.value;
-  // iOS Safari：不要太激进的 resolution/facingMode 约束，否则容易触发 OverconstrainedError
-  const base = { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 25 } };
+  // iOS Safari：用 640×480 省 video stream frame buffer 内存
+  // （WKWebView ~500MB 上限，1280×720 的 YUV buffer 比 640×480 多 4 倍）
+  const isIOS = window._isIOSSafari;
+  const base = isIOS
+    ? { width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 25 } }
+    : { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 25 } };
   const make = v => navigator.mediaDevices.getUserMedia({ video: v, audio: false });
   if (devId) {
     try {
-      return await make({ deviceId: { exact: devId } });
+      return await make({ ...base, deviceId: { exact: devId } });
     } catch (e) {
       // exact deviceId 在 iOS 上经常 OverconstrainedError → 退化为 ideal
       if (e.name === 'OverconstrainedError') {
-        try { return await make({ deviceId: { ideal: devId } }); } catch (_) {}
+        try { return await make({ ...base, deviceId: { ideal: devId } }); } catch (e2) {
+          console.warn('deviceId ideal 也失败', e2.message);
+        }
       }
-      if (e.name === 'OverconstrainedError' || e.name === 'NotFoundError') {
-        toast('所选摄像头不可用，改用默认摄像头', 'warn');
-        if (sel) sel.value = '';
-      } else throw e;
+      toast('所选摄像头不可用，改用默认摄像头', 'warn');
+      if (sel) sel.value = '';
+      // 明确选了 deviceId 但失败 → fallback，但按用户直觉 iOS 上默认前置
+      return await make({ ...base, facingMode: isIOS ? { ideal: 'user' } : { ideal: 'environment' } });
     }
   }
-  // 默认启用后置（environment），iOS Safari 用 ideal 不要 exact
-  return await make({ ...base, facingMode: { ideal: 'environment' } });
+  // 没选 deviceId：iOS Safari 默认前置（下拉框第一个通常是前置占位），桌面默认后置
+  return await make({ ...base, facingMode: isIOS ? { ideal: 'user' } : { ideal: 'environment' } });
 }
 
 // 温和停止：iOS Safari 上必须等 track 完全 stop 再 release stream，否则下一次 getUserMedia 会崩
@@ -584,11 +592,28 @@ video.addEventListener('play', () => {
   setTimeout(() => refreshCamerasDebounced(false), 500);
 });
 
-// beforeunload: 立即清理所有 pending debounce 定时器 + 重入锁
-// 不让旧页面的定时器在新页面里执行
+// beforeunload: 立即清理所有 pending debounce 定时器 + 重入锁 + 同步释放 AVFoundation
+// iOS Safari 上页面 reload 必须在 beforeunload 里**同步** stop 所有 video track
+// （不能等 async stop() 的 await 链，beforeunload 结束后 WKWebView 会硬杀旧页面）
 window.addEventListener('beforeunload', () => {
   if (_rcTimer) { clearTimeout(_rcTimer); _rcTimer = null; }
   _rcInProgress = false;
+  // 同步释放 video track — iOS Safari 上 AVFoundation 旧 session 不释放 → 新页面 getUserMedia 崩
+  const s = video && video.srcObject;
+  if (s) { s.getTracks().forEach(t => { try { t.enabled = false; t.stop(); } catch (_) {} }); }
+  // 清空视频源
+  try { video && (video.srcObject = null); } catch (_) {}
+  // 清空推理队列 — 不让 worker 在新页面里继续跑
+  state.inferQueue.length = 0;
+  state.inferWorkerRunning = false;
+  state.running = false;
+  // MediaPipe landmarker 同步 close（iOS Safari reload 时不 close → WASM 内存泄漏爆）
+  // 注意：ORT InferenceSession 没有 close()（WASM 内存由 GC 管），只有 MediaPipe landmarker 有
+  try { if (state.face && state.face.landmarker && state.face.landmarker.close) state.face.landmarker.close(); } catch (_) {}
+  try { if (geoState.watchId !== null) navigator.geolocation.clearWatch(geoState.watchId); } catch (_) {}
+  // 清理 feed blob URLs（防止内存泄漏）
+  _blobUrls.forEach(u => { try { URL.revokeObjectURL(u); } catch (_) {} });
+  _blobUrls.clear();
 });
 
 // 初始枚举：forceAuth=false（页面加载时没有用户手势）

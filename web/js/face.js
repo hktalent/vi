@@ -169,17 +169,19 @@ class FaceEngine {
     // GPU delegate 在部分机器的 ANGLE/Metal 上会导致 WebGL 上下文丢失（检测直接失效甚至拖崩系统），
     // 默认用 CPU(XNNPACK)；需要 GPU 时用 ?mpgpu=1 显式开启
     const wantGPU = !isIOS && new URLSearchParams(location.search).get('mpgpu') === '1';
+    // iOS Safari WKWebView 内存紧张：numFaces 10→3 省 WASM 内存 + 检测 CPU 开销
+    this.maxFaces = isIOS ? 3 : 10;
     this.vision = vision;
     this.fileset = fileset;
-    this.landmarker = await this.createLandmarker(wantGPU ? 'GPU' : 'CPU');
+    this.landmarker = await this.createLandmarker(wantGPU ? 'GPU' : 'CPU', this.maxFaces);
     onStep && onStep('人脸模型就绪');
   }
 
-  async createLandmarker(delegate) {
+  async createLandmarker(delegate, maxFaces = 10) {
     const mk = d => this.vision.FaceLandmarker.createFromOptions(this.fileset, {
       baseOptions: { modelAssetPath: '/models/face_landmarker.task', delegate: d },
       runningMode: 'VIDEO',
-      numFaces: 10,
+      numFaces: maxFaces,
       minFaceDetectionConfidence: 0.4,
       minFacePresenceConfidence: 0.4,
       minTrackingConfidence: 0.4,
@@ -204,7 +206,7 @@ class FaceEngine {
     } catch (e) {
       console.warn('FaceLandmarker 推理失败，重建 CPU 实例：' + e.message);
       try { this.landmarker.close && this.landmarker.close(); } catch (_) {}
-      this.landmarker = await this.createLandmarker('CPU');
+      this.landmarker = await this.createLandmarker('CPU', this.maxFaces || 10);
       return this.landmarker.detectForVideo(video, tsMs) || {};
     }
   }

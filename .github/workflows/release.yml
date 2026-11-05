@@ -80,13 +80,20 @@ jobs:
             *.tar.gz) tar xzf "$ASSET" ;;
             *.zip)    unzip -o  "$ASSET" ;;
           esac
-          # 找到解压后的 qdrant 二进制，重命名为统一名字
-          QD_BIN="$(find . -maxdepth 2 -type f -name 'qdrant*' | head -1)"
+          # 有些 Qdrant tar 把二进制直接放在根目录（./qdrant），有些放子目录（./qdrant-x86_64-linux-gnu/qdrant）
+          # 找到 qdrant 二进制，重命名为统一名字。不能 cp 同名文件 → 同一个文件报错
+          TARGET="qdrant${{ matrix.ext }}"
+          QD_BIN="$(find . -maxdepth 2 -type f -name 'qdrant*' ! -name '*.tar.gz' ! -name '*.zip' | head -1)"
           if [ -z "$QD_BIN" ]; then
             echo "⚠️  未在 ${ASSET} 中找到 qdrant 二进制，跳过"
-          else
+          elif [ "$(basename "$QD_BIN")" = "$TARGET" ]; then
+            # 已经是正确名字/位置，只加执行权限
+            echo "已经是 $TARGET，直接赋权"
             chmod +x "$QD_BIN" || true
-            cp "$QD_BIN" "qdrant${{ matrix.ext }}"
+          else
+            echo "cp $QD_BIN → $TARGET"
+            chmod +x "$QD_BIN" || true
+            cp "$QD_BIN" "$TARGET"
           fi
           ls -lh
 
