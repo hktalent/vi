@@ -340,6 +340,36 @@ func (s *Store) appendEvents(e *Event) error {
 	return err
 }
 
+// ImportFace 直接写入一条人脸事件 + upsert Qdrant，跳过同一性搜索和 cooldown。
+// 用于批量导入场景（importfaces），导入时不需要搜索匹配，直接插入即可。
+func (s *Store) ImportFace(personID string, vec []float32, imagePath, sourcePath string, capturedAt time.Time) (*Event, error) {
+	e := &Event{
+		ID:         newID(),
+		Kind:       "face",
+		CapturedAt: capturedAt,
+		Image:      imagePath,
+		PersonID:   personID,
+		CreatedAt:  time.Now(),
+	}
+	s.mu.Lock()
+	s.events = append(s.events, e)
+	s.mu.Unlock()
+	if err := s.appendEvents(e); err != nil {
+		log.Printf("[store] 写事件日志失败: %v", err)
+	}
+	payload := map[string]any{
+		"kind":        e.Kind,
+		"person_id":   e.PersonID,
+		"captured_at": e.CapturedAt.Format(time.RFC3339),
+		"image":       e.Image,
+		"source_path": sourcePath,
+	}
+	if err := s.qd.UpsertFace(e.ID, vec, payload); err != nil {
+		return e, fmt.Errorf("upsert face: %w", err)
+	}
+	return e, nil
+}
+
 // normalizePlate 把车牌号规整为大写无空格（内部使用）。
 func normalizePlate(s string) string {
 	s = strings.ToUpper(strings.TrimSpace(s))

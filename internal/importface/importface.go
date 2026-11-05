@@ -1,6 +1,7 @@
 package importface
 
 import (
+	"crypto/rand"
 	"fmt"
 	"image"
 	"log"
@@ -13,12 +14,14 @@ import (
 
 	"vi/internal/config"
 	"vi/internal/qdrant"
+	"vi/internal/store"
 )
 
 // Importer 把本地文件夹里的图片扫描一遍，检测人脸 → 裁剪 → 提取 embedding → upsert 到 Qdrant。
 type Importer struct {
 	cfg    config.Config
 	qd     *qdrant.Qdrant
+	st     *store.Store
 	cascade *gocv.CascadeClassifier
 	net     *gocv.Net
 	label   string // 可选标签，作为每张新脸的 PersonID 前缀
@@ -27,7 +30,7 @@ type Importer struct {
 
 // NewImporter 创建 Importer。
 // cascadeXML 是 OpenCV Haar cascade 路径（检测人脸用），arcOnnx 是 arc.onnx 路径（提取 embedding 用）。
-func NewImporter(cfg config.Config, qd *qdrant.Qdrant, cascadeXML, arcOnnx, label string, dryRun bool) (*Importer, error) {
+func NewImporter(cfg config.Config, qd *qdrant.Qdrant, st *store.Store, cascadeXML, arcOnnx, label string, dryRun bool) (*Importer, error) {
 	cc := gocv.NewCascadeClassifier()
 	if !cc.Load(cascadeXML) {
 		return nil, fmt.Errorf("加载 Haar cascade 失败: %s", cascadeXML)
@@ -37,7 +40,7 @@ func NewImporter(cfg config.Config, qd *qdrant.Qdrant, cascadeXML, arcOnnx, labe
 		return nil, fmt.Errorf("加载 arc.onnx 失败: %s", arcOnnx)
 	}
 	log.Printf("[import] OpenCV DNN 已加载 arc.onnx")
-	return &Importer{cfg: cfg, qd: qd, cascade: &cc, net: &net, label: label, dryRun: dryRun}, nil
+	return &Importer{cfg: cfg, qd: qd, st: st, cascade: &cc, net: &net, label: label, dryRun: dryRun}, nil
 }
 
 // Run 递归扫描 dir，导入所有图片。返回导入的人脸数量。
@@ -145,13 +148,14 @@ func (im *Importer) processImage(path string) (int, error) {
 		crop := img.Region(cropRect)
 		embedding, err := im.extractEmbedding(crop)
 		if err != nil {
+			log.Printf("[import] extractEmbedding 失败: %v", err)
 			crop.Close()
 			continue
 		}
-		crop.Close()
 
 		// 保存抠图
 		rel, err := im.saveFaceCrop(path, i, x, y, w, h, cropRect, crop)
+		crop.Close()
 		if err != nil {
 			log.Printf("[import] 保存抠图失败: %v", err)
 		}
@@ -162,17 +166,27 @@ func (im *Importer) processImage(path string) (int, error) {
 		}
 
 		personID := newPersonID(im.label, path, i)
-		payload := map[string]any{
-			"kind":        "face",
-			"person_id":   personID,
-			"source_path": path,
-			"source_file": filepath.Base(path),
-			"imported_at": time.Now().In(im.cfg.Location).Format(time.RFC3339),
-			"crop":        rel,
-		}
-		if err := im.qd.UpsertFace(personID, embedding, payload); err != nil {
-			log.Printf("[import] upsert Qdrant 失败: %v", err)
-			continue
+		if im.st != nil {
+			// 通过 Store 统一写入：Event（前端可见） + Qdrant（向量搜索）
+			if _, err := im.st.ImportFace(personID, embedding, rel, path, time.Now().In(im.cfg.Location)); err != nil {
+				log.Printf("[import] ImportFace 失败: %v", err)
+				continue
+			}
+		} else {
+			// 无 Store（dry-run 或独立模式）：只写 Qdrant
+			pointID := uuid4()
+			payload := map[string]any{
+				"kind":        "face",
+				"person_id":   personID,
+				"source_path": path,
+				"source_file": filepath.Base(path),
+				"imported_at": time.Now().In(im.cfg.Location).Format(time.RFC3339),
+				"crop":        rel,
+			}
+			if err := im.qd.UpsertFace(pointID, embedding, payload); err != nil {
+				log.Printf("[import] upsert Qdrant 失败: %v", err)
+				continue
+			}
 		}
 		saved++
 	}
@@ -182,6 +196,9 @@ func (im *Importer) processImage(path string) (int, error) {
 }
 
 // extractEmbedding 用 arc.onnx 提取 512 维特征向量。
+//
+// arc.onnx 是 TensorFlow 导出的，声明输入格式是 NHWC [batch, H, W, C]。
+// gocv.BlobFromImage 总是产出 NCHW，所以这里手动构造 NHWC 4D blob 传给 SetInput。
 func (im *Importer) extractEmbedding(crop gocv.Mat) ([]float32, error) {
 	// BGR → RGB（和浏览器端 arc.onnx 输入一致）
 	rgb := gocv.NewMat()
@@ -198,12 +215,16 @@ func (im *Importer) extractEmbedding(crop gocv.Mat) ([]float32, error) {
 	resized.ConvertToWithParams(&norm, gocv.MatTypeCV32F, 1.0/127.5, -127.5/127.5)
 	defer norm.Close()
 
-	// blobFromImage: mean(0,0,0), no swap, no crop
-	blob := gocv.BlobFromImage(norm, 1.0, image.Pt(112, 112), gocv.NewScalar(0, 0, 0, 0), false, false)
+	// 手动构造 NHWC 格式 4D blob：[1, 112, 112, 3]
+	// 内存布局和 norm（H×W×3 HWC）完全一致，直接 memcpy 即可
+	blob, err := makeNhwcBlob(norm)
+	if err != nil {
+		return nil, fmt.Errorf("构造 NHWC blob 失败: %w", err)
+	}
 	defer blob.Close()
 
-	im.net.SetInput(blob, "")
-	out := im.net.Forward("")
+	im.net.SetInput(blob, "input_1")
+	out := im.net.Forward("embedding")
 	defer out.Close()
 
 	// out shape 通常是 [1, 512]
@@ -211,6 +232,31 @@ func (im *Importer) extractEmbedding(crop gocv.Mat) ([]float32, error) {
 		return nil, fmt.Errorf("net.Forward 返回空")
 	}
 	return matToFloat32(out)
+}
+
+// makeNhwcBlob 从 HWC Mat 构造 NHWC 4D blob。
+// src 是 H×W×C 的 CV_32FC3 Mat，返回 dims=[1, H, W, C] 的 CV_32FC1 Mat，数据与 src 共享内存布局。
+func makeNhwcBlob(src gocv.Mat) (gocv.Mat, error) {
+	h, w, c := src.Rows(), src.Cols(), src.Channels()
+	if src.Type()&gocv.MatTypeCV32F != gocv.MatTypeCV32F {
+		return gocv.NewMat(), fmt.Errorf("src 必须是 CV_32F，实际 type=%d", src.Type())
+	}
+	if !src.IsContinuous() {
+		return gocv.NewMat(), fmt.Errorf("src 必须是连续 Mat")
+	}
+	dst := gocv.NewMatWithSizes([]int{1, h, w, c}, gocv.MatTypeCV32F)
+	srcData, err := src.DataPtrFloat32()
+	if err != nil {
+		dst.Close()
+		return gocv.NewMat(), err
+	}
+	dstData, err := dst.DataPtrFloat32()
+	if err != nil {
+		dst.Close()
+		return gocv.NewMat(), err
+	}
+	copy(dstData, srcData)
+	return dst, nil
 }
 
 func matToFloat32(m gocv.Mat) ([]float32, error) {
@@ -321,4 +367,17 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// uuid4 生成一个 UUID v4 字符串（随机 122 bit + 固定 version/variant）。
+func uuid4() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// crypto/rand 理论上不会失败，万一失败用 zero-padded fallback
+		return "00000000-0000-4000-8000-000000000000"
+	}
+	b[6] = (b[6] & 0x0f) | 0x40 // version 4
+	b[8] = (b[8] & 0x3f) | 0x80 // variant 10xx
+	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
+		b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
