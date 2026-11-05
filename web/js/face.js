@@ -86,20 +86,24 @@ class FaceEngine {
     ort.env.wasm.proxy = true;
     ort.env.logLevel = 'error';
 
-    onStep && onStep('并行载入人脸模型 (ArcFace + 属性 ×3 + MediaPipe)...');
-    // 全部并行：先用 Cache API / 网络 fetch ArrayBuffer，再喂给 ORT（比直接传 URL 更快更可控）
-    // Cache API 持久化：第二次打开直接从磁盘读 → 零网络
-    const [arcAB, genderAB, ageAB, glassesAB] = await Promise.all([
+    // 预热 WASM runtime（显式 init 比第一次 createSession 隐式初始化快）
+    try { await ort.env.wasm.init(); } catch (e) { /* 某些构建不支持，忽略 */ }
+
+    onStep && onStep('并行载入人脸模型...');
+    // 最激进并行：ORT 4 个 session create + MediaPipe vision bundle import 同时发！
+    // Cache API 命中 ArrayBuffer 后 createSession 瓶颈在 WASM 图优化 → 用 'basic' 替代 'all' 快 N 倍
+    const [arcAB, genderAB, ageAB, glassesAB, visionImport] = await Promise.all([
       _modelAB('/models/arc.onnx'),
       _modelAB('/models/face_gender.onnx').catch(() => null),
       _modelAB('/models/face_age.onnx').catch(() => null),
       _modelAB('/models/face_glasses.onnx').catch(() => null),
+      import('/vendor/mp/vision_bundle.mjs'),   // ← MediaPipe 和 ORT 并行！
     ]);
     const [arc, gender, age, glasses] = await Promise.all([
-      ort.InferenceSession.create(arcAB, { executionProviders: ['wasm'], graphOptimizationLevel: 'all' }),
-      genderAB ? ort.InferenceSession.create(genderAB, { executionProviders: ['wasm'], graphOptimizationLevel: 'all' }).catch(() => null) : Promise.resolve(null),
-      ageAB    ? ort.InferenceSession.create(ageAB,    { executionProviders: ['wasm'], graphOptimizationLevel: 'all' }).catch(() => null) : Promise.resolve(null),
-      glassesAB? ort.InferenceSession.create(glassesAB,{ executionProviders: ['wasm'], graphOptimizationLevel: 'all' }).catch(() => null) : Promise.resolve(null),
+      ort.InferenceSession.create(arcAB, { executionProviders: ['wasm'], graphOptimizationLevel: 'basic' }),
+      genderAB ? ort.InferenceSession.create(genderAB, { executionProviders: ['wasm'], graphOptimizationLevel: 'basic' }).catch(() => null) : Promise.resolve(null),
+      ageAB    ? ort.InferenceSession.create(ageAB,    { executionProviders: ['wasm'], graphOptimizationLevel: 'basic' }).catch(() => null) : Promise.resolve(null),
+      glassesAB? ort.InferenceSession.create(glassesAB,{ executionProviders: ['wasm'], graphOptimizationLevel: 'basic' }).catch(() => null) : Promise.resolve(null),
     ]);
     this.session = arc;
     this.inName = arc.inputNames[0];
@@ -109,7 +113,8 @@ class FaceEngine {
     this.sessAge = age;
     this.sessGlasses = glasses;
 
-    const vision = await import('/vendor/mp/vision_bundle.mjs');
+    // MediaPipe：已经和 ORT 并行下载了 vision_bundle.mjs，现在用就行
+    const vision = visionImport;
     const fileset = await vision.FilesetResolver.forVisionTasks('/vendor/mp/wasm');
     // GPU delegate 在部分机器的 ANGLE/Metal 上会导致 WebGL 上下文丢失（检测直接失效甚至拖崩系统），
     // 默认用 CPU(XNNPACK)；需要 GPU 时用 ?mpgpu=1 显式开启

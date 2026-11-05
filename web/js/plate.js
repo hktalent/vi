@@ -50,8 +50,8 @@ class PlateEngine {
       (async () => (await (await fetch('/models/chars.json')).json()))(),
     ]);
     const [det, rec] = await Promise.all([
-      ort.InferenceSession.create(detAB, { executionProviders: ['wasm'], graphOptimizationLevel: 'all' }),
-      ort.InferenceSession.create(recAB, { executionProviders: ['wasm'], graphOptimizationLevel: 'all' }),
+      ort.InferenceSession.create(detAB, { executionProviders: ['wasm'], graphOptimizationLevel: 'basic' }),
+      ort.InferenceSession.create(recAB, { executionProviders: ['wasm'], graphOptimizationLevel: 'basic' }),
     ]);
     this.det = det;
     this.rec = rec;
