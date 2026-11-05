@@ -162,10 +162,10 @@ h2 { font-size: 15px; margin: 0 0 12px; color: var(--text); }
 .chip.bad .dot { background: var(--danger); }
 .chip.warn .dot { background: var(--warn); }
 
-.stats-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
-.stat { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px 16px; }
-.stat .num { font-size: 26px; font-weight: 700; color: var(--accent); line-height: 1.1; }
-.stat .lbl { color: var(--muted); font-size: 12px; margin-top: 4px; }
+.stats-row { display: flex; gap: 6px; flex-shrink: 0; }
+.stat { flex: 1 1 0; min-width: 0; background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 6px 8px; text-align: center; }
+.stat .num { font-size: 18px; font-weight: 700; color: var(--accent); line-height: 1.1; }
+.stat .lbl { color: var(--muted); font-size: 11px; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
 .feed { flex: 1 1 auto; min-height: 0; overflow: auto; display: grid; gap: 10px; align-content: start; }
 .feed-item {
@@ -273,7 +273,6 @@ body.status-collapsed .status-mini:hover { color: var(--accent); }
 }
 
 @media (max-width: 760px) {
-  .stats-row { grid-template-columns: repeat(2, 1fr); }
   .nav a { padding: 7px 9px; font-size: 12px; }
   .brand small { display: none; }
   .wrap { padding: 14px 12px 40px; }
@@ -286,9 +285,9 @@ body.status-collapsed .status-mini:hover { color: var(--accent); }
   .sub { display: none; }
   .panel { padding: 12px; border-radius: 12px; }
   .stage { aspect-ratio: 3 / 4; max-height: 66vh; }
-  .stat { padding: 10px 12px; }
-  .stat .num { font-size: 22px; }
   .feed { max-height: none; }
   .toast-wrap { left: 12px; right: 12px; bottom: 12px; }
   .toast { min-width: 0; font-size: 13px; }
+  .stat .num { font-size: 15px; }
+  .stat .lbl { font-size: 10px; }
 }
