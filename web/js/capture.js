@@ -367,31 +367,46 @@ async function start() {
 async function openCamera() {
   const sel = document.getElementById('selCamera');
   const devId = sel && sel.value;
+  // iOS Safari：不要太激进的 resolution/facingMode 约束，否则容易触发 OverconstrainedError
   const base = { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 25 } };
   const make = v => navigator.mediaDevices.getUserMedia({ video: v, audio: false });
   if (devId) {
     try {
-      return await make({ ...base, deviceId: { exact: devId } });
+      return await make({ deviceId: { exact: devId } });
     } catch (e) {
+      // exact deviceId 在 iOS 上经常 OverconstrainedError → 退化为 ideal
+      if (e.name === 'OverconstrainedError') {
+        try { return await make({ deviceId: { ideal: devId } }); } catch (_) {}
+      }
       if (e.name === 'OverconstrainedError' || e.name === 'NotFoundError') {
         toast('所选摄像头不可用，改用默认摄像头', 'warn');
         if (sel) sel.value = '';
       } else throw e;
     }
   }
+  // 默认启用后置（environment），iOS Safari 用 ideal 不要 exact
   return await make({ ...base, facingMode: { ideal: 'environment' } });
 }
 
+// 温和停止：iOS Safari 上必须等 track 完全 stop 再 release stream，否则下一次 getUserMedia 会崩
 function stop() {
   state.running = false;
   const stream = video.srcObject;
-  if (stream) stream.getTracks().forEach(t => t.stop());
+  if (stream) {
+    stream.getTracks().forEach(t => { t.enabled = false; t.stop(); });
+    // iOS Safari: 先等一个 macrotask 让 AVFoundation 释放
+    return new Promise(resolve => setTimeout(() => {
+      video.srcObject = null;
+      ctx.clearRect(0, 0, overlay.width, overlay.height);
+      resolve();
+    }, 100));
+  }
   video.srcObject = null;
+  ctx.clearRect(0, 0, overlay.width, overlay.height);
   document.getElementById('emptyTip').style.display = 'grid';
   setChip('chipCamera', null, '摄像头已停止');
   document.getElementById('btnStart').disabled = false;
   document.getElementById('btnStop').disabled = true;
-  ctx.clearRect(0, 0, overlay.width, overlay.height);
   setLive('已停止');
 }
 
@@ -455,13 +470,26 @@ document.getElementById('btnRefreshCam').addEventListener('click', () => {
   refreshCameras();
   toast('已刷新设备列表', '', 1600);
 });
-document.getElementById('selCamera').addEventListener('change', e => {
+document.getElementById('selCamera').addEventListener('change', async e => {
   try { localStorage.setItem(CAM_KEY, e.target.value); } catch (err) {}
-  if (state.running) { stop(); start(); }  // 运行中切换立即生效
+  if (state.running) {
+    await stop();   // iOS 必须等完全 stop 再 start
+    setTimeout(() => start(), 200);  // 再等 200ms 让 AVFoundation 彻底释放
+  }
 });
+// 摄像头设备列表：iOS Safari 几个已知坑
+// 1. enumerateDevices 必须在有活跃 getUserMedia 流时才返回真实 label（授权前全是空字符串）
+// 2. devicechange 事件在 iOS Safari 上**根本不触发** — 只能手动调
+// 3. 刷新按钮/切换摄像头/页面可见时都重新枚举
 if (navigator.mediaDevices && navigator.mediaDevices.addEventListener) {
   navigator.mediaDevices.addEventListener('devicechange', refreshCameras);
 }
+// iOS Safari devicechange 不触发 → visibilitychange 兜底（切前后台回来重枚举）
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) refreshCameras();
+});
+// iOS Safari 前后摄像头切换后视频流恢复时再枚举一次
+video.addEventListener('play', () => setTimeout(refreshCameras, 500));
 refreshCameras();
 
 // 运行状态栏：默认收起（手机优先），用户手动展开后记住选择

@@ -95,24 +95,37 @@ const Auth = {
 };
 
 // ── Cache API 持久化缓存模型文件 ──
-// 比浏览器 HTTP 缓存靠谱 N 倍：Safari/Chrome 都会存到磁盘，
-// 第二次打开页面直接从磁盘读 ArrayBuffer → 零网络、毫秒级
-// Safari 支持 Cache API（iOS 11+/macOS 10.13+）
+// Safari/iOS 限制：单个 origin 通常 500MB 上限，resp.clone() 大文件可能失败
+// 降级策略：Cache API 失败 → 直接 fetch 走 HTTP 缓存（immutable + max-age=1y）
 const _MODEL_CACHE = 'vi-models-v1';
+const _cacheDisabled = new Set();   // 记录哪些 URL 的 Cache API 存失败过，后续直接 fetch
+
 async function _modelAB(url) {
-  if (typeof caches === 'undefined') {
-    // 环境不支持 Cache API → 直接 fetch（退化为 HTTP 缓存）
+  // 某些环境（iOS Safari 低版本 / 隐私模式）Cache API 不可用 → 直接 fetch
+  if (typeof caches === 'undefined' || _cacheDisabled.has(url)) {
     return (await fetch(url)).arrayBuffer();
   }
-  const cache = await caches.open(_MODEL_CACHE);
-  const hit = await cache.match(url);
-  if (hit) return hit.arrayBuffer();       // ✅ 命中磁盘缓存，零网络
-  const resp = await fetch(url);
-  if (resp.ok) {
-    await cache.put(url, resp.clone());     // 存入 Cache API
+  try {
+    const cache = await caches.open(_MODEL_CACHE);
+    const hit = await cache.match(url);
+    if (hit) return hit.arrayBuffer();
+    const resp = await fetch(url);
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    // resp.clone() 在 Safari 大文件上可能失败 → try/catch 包
+    try {
+      await cache.put(url, resp.clone());
+    } catch (cloneErr) {
+      // Safari 有时 clone 大 Response 失败 → 不存，继续用 resp 本身
+      console.warn('Cache API clone 失败（Safari 大文件），跳过持久化：', url, cloneErr.message);
+      _cacheDisabled.add(url); // 标记，后续不再尝试存这个 URL
+    }
     return resp.arrayBuffer();
+  } catch (e) {
+    // 整个 Cache API 流程挂了（磁盘满 / 隐私模式）→ 降级 fetch
+    console.warn('Cache API 异常，降级 fetch：', e.message);
+    _cacheDisabled.add(url);
+    return (await fetch(url)).arrayBuffer();
   }
-  throw new Error('模型下载失败 ' + url + ' HTTP ' + resp.status);
 }
 
 const api = {

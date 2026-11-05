@@ -87,7 +87,10 @@ class FaceEngine {
     ort.env.logLevel = 'error';
 
     // 预热 WASM runtime（显式 init 比第一次 createSession 隐式初始化快）
-    try { await ort.env.wasm.init(); } catch (e) { /* 某些构建不支持，忽略 */ }
+    // 注意：ort.env.wasm.init() 在某些 iOS Safari 构建上不存在，要先判
+    if (typeof ort.env.wasm.init === 'function') {
+      try { await ort.env.wasm.init(); } catch (e) { /* 忽略 */ }
+    }
 
     onStep && onStep('并行载入人脸模型...');
     // 最激进并行：ORT 4 个 session create + MediaPipe vision bundle import 同时发！
