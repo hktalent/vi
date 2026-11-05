@@ -96,13 +96,18 @@ const Auth = {
 
 // ── Cache API 持久化缓存模型文件 ──
 // Safari/iOS 限制：单个 origin 通常 500MB 上限，resp.clone() 大文件可能失败
-// 降级策略：Cache API 失败 → 直接 fetch 走 HTTP 缓存（immutable + max-age=1y）
+// 关键：iOS Safari WKWebView per-process 内存上限 ~500MB
+//       Cache API hit.arrayBuffer() 把模型全读进内存 → ORT create 再拷贝到 WASM → 双份内存
+//       arc.onnx(130MB) + FairFace三模型(250MB) × 2 = 760MB → 💥 崩溃
+// 修复：iOS Safari 禁用 Cache API，让它走 HTTP immutable 缓存（按需 fetch，内存开销只在 ORT create 时）
 const _MODEL_CACHE = 'vi-models-v1';
 const _cacheDisabled = new Set();   // 记录哪些 URL 的 Cache API 存失败过，后续直接 fetch
+const _disableCacheAPI = /iP(hone|od|ad)/.test(navigator.platform) ||
+  (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);  // iPadOS 也禁用
 
 async function _modelAB(url) {
-  // 某些环境（iOS Safari 低版本 / 隐私模式）Cache API 不可用 → 直接 fetch
-  if (typeof caches === 'undefined' || _cacheDisabled.has(url)) {
+  // iOS/iPadOS Safari: 禁用 Cache API — 400MB 模型全进 JS 内存 + WASM 拷贝 → 内存爆
+  if (_disableCacheAPI || typeof caches === 'undefined' || _cacheDisabled.has(url)) {
     return (await fetch(url)).arrayBuffer();
   }
   try {
@@ -117,7 +122,7 @@ async function _modelAB(url) {
     } catch (cloneErr) {
       // Safari 有时 clone 大 Response 失败 → 不存，继续用 resp 本身
       console.warn('Cache API clone 失败（Safari 大文件），跳过持久化：', url, cloneErr.message);
-      _cacheDisabled.add(url); // 标记，后续不再尝试存这个 URL
+      _cacheDisabled.add(url);
     }
     return resp.arrayBuffer();
   } catch (e) {
