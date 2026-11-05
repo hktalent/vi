@@ -23,34 +23,41 @@ type Server struct {
 func NewServer(cfg Config, st *Store) http.Handler {
 	s := &Server{cfg: cfg, st: st, mux: http.NewServeMux()}
 
+	// —— 公开接口（免登录）——
+	s.mux.HandleFunc("POST /api/login", s.handleLogin)
+	s.mux.HandleFunc("POST /api/logout", s.handleLogout)
+	s.mux.HandleFunc("GET  /api/me", s.handleMe)
+	s.mux.HandleFunc("POST /api/password", s.handleChangePassword)
 	s.mux.HandleFunc("GET /api/health", s.handleHealth)
-	s.mux.HandleFunc("POST /api/capture", s.handleCapture)
 
-	s.mux.HandleFunc("GET /api/labels", s.handleLabels)
-	s.mux.HandleFunc("POST /api/labels", s.handleAddLabel)
-	s.mux.HandleFunc("PATCH /api/labels/{id}", s.handlePatchLabel)
-	s.mux.HandleFunc("DELETE /api/labels/{id}", s.handleDeleteLabel)
-	s.mux.HandleFunc("GET /api/identities", s.handleIdentities)
+	// —— 需登录 ——
+	s.mux.HandleFunc("POST /api/capture", requireAuth(s.handleCapture))
 
-	s.mux.HandleFunc("GET /api/search/date", s.handleSearchDate)
-	s.mux.HandleFunc("GET /api/search/plate", s.handleSearchPlate)
-	s.mux.HandleFunc("GET /api/search/label", s.handleSearchLabel)
-	s.mux.HandleFunc("GET /api/search/place", s.handleSearchPlace)
+	// —— 需登录 ——
+	s.mux.HandleFunc("GET /api/labels", requireAuth(s.handleLabels))
+	s.mux.HandleFunc("POST /api/labels", requireAuth(s.handleAddLabel))
+	s.mux.HandleFunc("PATCH /api/labels/{id}", requireAuth(s.handlePatchLabel))
+	s.mux.HandleFunc("DELETE /api/labels/{id}", requireAuth(s.handleDeleteLabel))
+	s.mux.HandleFunc("GET /api/identities", requireAuth(s.handleIdentities))
 
-	s.mux.HandleFunc("GET /api/stats", s.handleStats)
-	s.mux.HandleFunc("GET /api/alerts", s.handleAlerts)
-	s.mux.HandleFunc("POST /api/summary/run", s.handleSummaryRun)
-	s.mux.HandleFunc("GET /api/summary/list", s.handleSummaryList)
+	s.mux.HandleFunc("GET /api/search/date", requireAuth(s.handleSearchDate))
+	s.mux.HandleFunc("GET /api/search/plate", requireAuth(s.handleSearchPlate))
+	s.mux.HandleFunc("GET /api/search/label", requireAuth(s.handleSearchLabel))
+	s.mux.HandleFunc("GET /api/search/place", requireAuth(s.handleSearchPlace))
 
-	// 清库（重置事件/标签/向量/告警），用于清理测试残留
-	s.mux.HandleFunc("POST /api/admin/reset", s.handleAdminReset)
+	s.mux.HandleFunc("GET /api/stats", requireAuth(s.handleStats))
+	s.mux.HandleFunc("GET /api/alerts", requireAuth(s.handleAlerts))
+	s.mux.HandleFunc("POST /api/summary/run", requireAuth(s.handleSummaryRun))
+	s.mux.HandleFunc("GET /api/summary/list", requireAuth(s.handleSummaryList))
+
+	s.mux.HandleFunc("POST /api/admin/reset", requireAuth(s.handleAdminReset))
 
 	web := http.FileServer(http.Dir(cfg.WebDir))
 	vendor := http.FileServer(http.Dir(filepath.Join(cfg.WebDir, "vendor")))
 	media := http.FileServer(http.Dir(filepath.Join(cfg.DataDir, "images")))
 	models := http.FileServer(http.Dir(cfg.ModelsDir))
 	reports := http.FileServer(http.Dir(filepath.Join(cfg.DataDir, "reports")))
-	s.mux.Handle("/media/", wrapCache(media, "public, max-age=3600"))
+	s.mux.Handle("/media/", wrapCache(requireAuthHandler(http.StripPrefix("/media/", media)), "public, max-age=3600"))
 	// 模型文件与第三方依赖：immutable + 超长缓存，除非后端强制更换版本才失效
 	s.mux.Handle("/models/", wrapCache(http.StripPrefix("/models/", models), "public, max-age=31536000, immutable"))
 	s.mux.Handle("/vendor/", wrapCache(http.StripPrefix("/vendor/", vendor), "public, max-age=31536000, immutable"))

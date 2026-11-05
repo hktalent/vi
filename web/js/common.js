@@ -1,37 +1,96 @@
-// 通用工具：API 请求、时间格式、提示、鸣叫
-const api = {
-  async get(url) {
-    const r = await fetch(url);
-    const j = await r.json().catch(() => ({}));
-    if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
-    return j;
+// 通用工具：API 请求、时间格式、提示、鸣叫、登录态
+const TOKEN_KEY = 'vi_token';
+
+// Auth 模块：token 存取、登录/登出/会话检查
+const Auth = {
+  get token() { return localStorage.getItem(TOKEN_KEY) || ''; },
+  set token(v) {
+    if (v) localStorage.setItem(TOKEN_KEY, v);
+    else localStorage.removeItem(TOKEN_KEY);
   },
-  async post(url, body) {
-    const r = await fetch(url, {
+  isLoggedIn() { return !!this.token; },
+  requireLogin(loginUrl = '/login.html') {
+    if (!this.isLoggedIn()) {
+      const q = new URLSearchParams({ next: location.pathname + location.search });
+      location.replace(loginUrl + '?' + q.toString());
+      return false;
+    }
+    return true;
+  },
+  async login(username, password) {
+    const r = await fetch('/api/login', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body)
+      body: JSON.stringify({ username, password })
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
+    this.token = j.token;
+    return j;
+  },
+  async logout() {
+    if (this.token) {
+      await fetch('/api/logout', {
+        method: 'POST',
+        headers: this._headers()
+      }).catch(() => {});
+    }
+    this.token = '';
+  },
+  async me() {
+    const r = await fetch('/api/me', { headers: this._headers() });
+    if (!r.ok) { this.token = ''; return null; }
+    return r.json().catch(() => null);
+  },
+  async changePassword(oldPwd, newPwd) {
+    const r = await fetch('/api/password', {
+      method: 'POST',
+      headers: { ...this._headers(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ old_password: oldPwd, new_password: newPwd })
     });
     const j = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
     return j;
   },
-  async patch(url, body) {
-    const r = await fetch(url, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body)
-    });
-    const j = await r.json().catch(() => ({}));
-    if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
-    return j;
+  // 把图片相对路径（如 "2026/11/05/face-xxx.jpg"）或绝对 /media/ URL
+  // 变成带 token 的可访问 URL，供 <img src> 使用
+  mediaUrl(path) {
+    if (!path) return '';
+    let url = path.startsWith('/') ? path : ('/media/' + path);
+    if (this.token) {
+      url += (url.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(this.token);
+    }
+    return url;
   },
-  async del(url) {
-    const r = await fetch(url, { method: 'DELETE' });
-    const j = await r.json().catch(() => ({}));
-    if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
-    return j;
+  _headers(extra = {}) {
+    const h = { ...extra };
+    if (this.token) h['Authorization'] = 'Bearer ' + this.token;
+    return h;
   }
+};
+
+const api = {
+  _buildInit(method, body) {
+    const h = { ...(Auth._headers()), 'Content-Type': 'application/json' };
+    const init = { method, headers: h };
+    if (body !== undefined) init.body = JSON.stringify(body);
+    return init;
+  },
+  async _req(url, init) {
+    const r = await fetch(url, init);
+    const j = await r.json().catch(() => ({}));
+    if (r.status === 401) {
+      Auth.token = '';
+      Auth.requireLogin();
+      throw new Error('未登录');
+    }
+    if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
+    return j;
+  },
+  async get(url)    { return this._req(url, { headers: Auth._headers() }); },
+  async post(url, body) { return this._req(url, this._buildInit('POST', body)); },
+  async patch(url, body){ return this._req(url, this._buildInit('PATCH', body)); },
+  async del(url)    { return this._req(url, { method: 'DELETE', headers: Auth._headers() }); }
 };
 
 function toast(msg, kind = '', ms = 3200) {
@@ -142,6 +201,7 @@ function fmtCoord(lat, lon) {
 }
 
 window.api = api;
+window.Auth = Auth;
 window.toast = toast;
 window.esc = esc;
 window.beeper = beeper;

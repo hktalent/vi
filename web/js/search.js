@@ -64,7 +64,7 @@ async function search(p = 1) {
           <td>${obj}${attrs ? `<div class="muted" style="font-size:11px;">${esc(attrs)}</div>` : ''}${e.sim ? `<div class="muted" style="font-size:11px;">相似度 ${(e.sim * 100).toFixed(1)}%</div>` : ''}</td>
           <td>${esc(e.address || '—')}</td>
           <td class="mono muted" style="font-size:11px;">${esc(fmtCoord(e.lat, e.lon) || '—')}</td>
-          <td><a href="${e.image}" target="_blank"><img class="thumb ${e.kind}" src="${e.image}" alt="" /></a></td>
+          <td><a href="${Auth.mediaUrl(e.image)}" target="_blank"><img class="thumb ${e.kind}" src="${Auth.mediaUrl(e.image)}" alt="" /></a></td>
         </tr>`;
     }).join('');
   } catch (e) {

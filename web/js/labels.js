@@ -51,7 +51,7 @@ async function loadIdentities() {
       ].filter(Boolean).join(' · ') : '';
       return `
       <div class="card">
-        <a href="${it.image}" target="_blank"><img class="cover" src="${it.image}" alt="" /></a>
+        <a href="${Auth.mediaUrl(it.image)}" target="_blank"><img class="cover" src="${Auth.mediaUrl(it.image)}" alt="" /></a>
         <div class="body">
           <div class="name">${kind === 'plate' ? esc(it.plate_text || it.key) : (labels.length ? esc(labels.join('、')) : '未命名人脸')}</div>
           ${attrs ? `<div class="meta">${esc(attrs)}</div>` : ''}

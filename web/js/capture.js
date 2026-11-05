@@ -49,7 +49,7 @@ function addFeed(res, kind) {
   const div = document.createElement('div');
   div.className = 'feed-item';
   div.innerHTML = `
-    <img src="${e.image}" alt="" />
+    <img src="${Auth.mediaUrl(e.image)}" alt="" />
     <div>
       <div class="title">${esc(title)} <span class="badge ${kind}">${kind === 'plate' ? '车牌' : '人脸'}</span>
         ${e.labels && e.labels.length ? '<span class="badge beep">' + esc(e.labels.join('、')) + '</span>' : ''}</div>
@@ -95,7 +95,7 @@ async function uploadFace(canvas, embedding, attrs) {
     if (attrs.glasses) fd.append('glasses', attrs.glasses);
   }
   fd.append('image', await blobOf(canvas), 'face.jpg');
-  const r = await fetch('/api/capture', { method: 'POST', body: fd });
+  const r = await fetch('/api/capture', { method: 'POST', body: fd, headers: Auth._headers() });
   const j = await r.json();
   if (!r.ok) throw new Error(j.error || '上传失败');
   await handleResult(j, 'face');
@@ -106,7 +106,7 @@ async function uploadPlate(canvas, text, conf) {
   fd.append('plate_text', text);
   fd.append('plate_conf', String(conf));
   fd.append('image', await blobOf(canvas), 'plate.jpg');
-  const r = await fetch('/api/capture', { method: 'POST', body: fd });
+  const r = await fetch('/api/capture', { method: 'POST', body: fd, headers: Auth._headers() });
   const j = await r.json();
   if (!r.ok) throw new Error(j.error || '上传失败');
   await handleResult(j, 'plate');

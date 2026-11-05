@@ -106,6 +106,10 @@ func main() {
 
 	go runSummaryScheduler(cfg, st)
 
+	if err := loadUsers(cfg.DataDir); err != nil {
+		log.Fatalf("加载用户失败: %v", err)
+	}
+
 	srv := NewServer(cfg, st)
 	log.Printf("vi 已启动: http://%s  (人脸阈值 %.2f, 冷却 %s)", cfg.Addr, cfg.FaceThresh, cfg.Cooldown)
 	if err := http.ListenAndServe(cfg.Addr, srv); err != nil {
