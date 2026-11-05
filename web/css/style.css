@@ -88,7 +88,7 @@ a:hover { text-decoration: underline; }
 .panel h2 { flex-shrink: 0; margin: 0 0 6px; }
 
 .grid { display: grid; gap: 10px; }
-.main-grid { grid-template-columns: 1fr 1fr; align-items: start; }
+.main-grid { align-items: stretch; }
 
 /* status-row: chips 占位就行，按钮 absolute 到 panel 右上角 */
 .status-row { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; flex-shrink: 0; padding-right: 32px; }

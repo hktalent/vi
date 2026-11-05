@@ -83,7 +83,9 @@ class FaceEngine {
     ort.env.wasm.numThreads = self.crossOriginIsolated
       ? Math.min(4, navigator.hardwareConcurrency || 1) : 1;
     // proxy=true：推理放到 Worker 里跑，避免 ArcFace/属性模型长时间阻塞主线程（画面卡顿）
-    ort.env.wasm.proxy = true;
+    // ⚠️ iOS Safari：proxy 会额外创建一个 Worker 副本 WASM 内存 → 爆内存 → 关闭
+    const isIOS = window._isIOSSafari;
+    ort.env.wasm.proxy = !isIOS;
     ort.env.logLevel = 'error';
 
     // 预热 WASM runtime（显式 init 比第一次 createSession 隐式初始化快）
@@ -94,28 +96,25 @@ class FaceEngine {
 
     onStep && onStep('载入人脸模型...');
 
-    // iOS Safari: 串行加载模型 —— 4 个模型并行 fetch(380MB) + createSession(380MB) = 760MB 峰值
-    // 超过 WKWebView ~500MB 上限 → 崩溃。串行后峰值 ≈ 130MB（单个 arc.onnx）。
-    // 桌面端保持并行 + MediaPipe vision bundle 一起 import，加载最快。
     let arc, gender, age, glasses;
-    const visionImport = import('/vendor/mp/vision_bundle.mjs');  // MediaPipe 始终并行，小文件
-    const isIOS = window._isIOSSafari;
+    // iOS 不提前 import MediaPipe（避免和 ORT 模型抢内存峰值），桌面端提前并行省时间
+    let visionImport = null;
 
     if (isIOS) {
-      // ── 串行加载：arc(130MB) 必需，属性模型默认跳过省内存 ──
-      // WKWebView ~500MB 上限，arc 130MB + 属性 250MB + plate 13MB + MediaPipe ≈ 480MB 接近上限
-      // 稳态内存也会超。默认只加载 arc，用 ?iosfull=1 强制加载全部（可能崩溃）
+      // ── iOS Safari: 全部串行加载 ──
+      // 峰值控制：arc(130MB) AB → createSession → 释放 AB → MediaPipe import(小) → landmarker create
       const loadAttrs = new URLSearchParams(location.search).get('iosfull') === '1';
       const opts = { executionProviders: ['wasm'], graphOptimizationLevel: 'basic' };
 
-      // 1. arc.onnx (必需)
+      // 1. arc.onnx (必需) — 130MB
       onStep && onStep('载入 ArcFace...');
       let ab = await _modelAB('/models/arc.onnx');
       arc = await ort.InferenceSession.create(ab, opts);
-      ab = null;  // 立即释放！
+      ab = null;  // 立即释放原始 AB！让 GC 回收
+      await new Promise(r => setTimeout(r, 30));  // 等一帧 GC
 
       if (loadAttrs) {
-        // 2-4. 属性模型 (可选，iOS 默认跳过)
+        // 2-4. 属性模型 (可选，iOS 默认跳过省 ~250MB)
         onStep && onStep('载入性别模型...');
         try { ab = await _modelAB('/models/face_gender.onnx'); gender = await ort.InferenceSession.create(ab, opts); }
         catch (e) { gender = null; }
@@ -134,10 +133,11 @@ class FaceEngine {
         onStep && onStep('跳过属性模型（iOS 内存优化，加 ?iosfull=1 启用）');
       }
 
-      // 显式提示 GC（Safari 偶尔 GC 不及时）
+      // 显式提示 GC
       if (typeof globalThis.gc === 'function') { try { globalThis.gc(); } catch (e) {} }
     } else {
       // ── 桌面端：并行加载最快 ──
+      visionImport = import('/vendor/mp/vision_bundle.mjs');  // MediaPipe 提前并行
       onStep && onStep('并行载入人脸模型...');
       const [arcAB, genderAB, ageAB, glassesAB] = await Promise.all([
         _modelAB('/models/arc.onnx'),
@@ -162,8 +162,9 @@ class FaceEngine {
     this.sessAge = age;
     this.sessGlasses = glasses;
 
-    // MediaPipe：vision bundle 早已并行 import 完了，直接用
-    const vision = await visionImport;
+    // MediaPipe: iOS 串行 import（arc 已释放无峰值冲突），桌面端取提前并行的结果
+    onStep && onStep('载入 MediaPipe...');
+    const vision = visionImport ? await visionImport : await import('/vendor/mp/vision_bundle.mjs');
     const fileset = await vision.FilesetResolver.forVisionTasks('/vendor/mp/wasm');
     // GPU delegate 在部分机器的 ANGLE/Metal 上会导致 WebGL 上下文丢失（检测直接失效甚至拖崩系统），
     // 默认用 CPU(XNNPACK)；需要 GPU 时用 ?mpgpu=1 显式开启
