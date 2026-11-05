@@ -36,7 +36,7 @@ function setLive(msg) {
   if (el) el.textContent = msg;
 }
 
-function addFeed(res, kind) {
+async function addFeed(res, kind) {
   const feed = document.getElementById('feed');
   if (feed.querySelector('.note')) feed.innerHTML = '';
   const e = res.event;
@@ -46,10 +46,11 @@ function addFeed(res, kind) {
   const attrs = kind === 'face' ? attrText({
     gender: e.gender, age_range: e.age_range, glasses: e.glasses
   }) : '';
+  const signedUrl = await Auth.mediaUrl(e.image);
   const div = document.createElement('div');
   div.className = 'feed-item';
   div.innerHTML = `
-    <img src="${Auth.mediaUrl(e.image)}" alt="" />
+    <img src="${signedUrl}" alt="" />
     <div>
       <div class="title">${esc(title)} <span class="badge ${kind}">${kind === 'plate' ? '车牌' : '人脸'}</span>
         ${e.labels && e.labels.length ? '<span class="badge beep">' + esc(e.labels.join('、')) + '</span>' : ''}</div>

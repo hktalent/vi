@@ -42,7 +42,12 @@ async function loadIdentities() {
       wrap.innerHTML = '<div class="note">没有匹配的身份。</div>';
       return;
     }
-    wrap.innerHTML = data.items.map(it => {
+    // 批量换签名 URL
+    const signedItems = await Promise.all(data.items.map(async it => ({
+      ...it,
+      _signedImage: await Auth.mediaUrl(it.image)
+    })));
+    wrap.innerHTML = signedItems.map(it => {
       const labels = it.labels || [];
       const attrs = kind === 'face' ? [
         it.gender === 'male' ? '男' : it.gender === 'female' ? '女' : '',
@@ -51,7 +56,7 @@ async function loadIdentities() {
       ].filter(Boolean).join(' · ') : '';
       return `
       <div class="card">
-        <a href="${Auth.mediaUrl(it.image)}" target="_blank"><img class="cover" src="${Auth.mediaUrl(it.image)}" alt="" /></a>
+        <a href="${it._signedImage}" target="_blank"><img class="cover" src="${it._signedImage}" alt="" /></a>
         <div class="body">
           <div class="name">${kind === 'plate' ? esc(it.plate_text || it.key) : (labels.length ? esc(labels.join('、')) : '未命名人脸')}</div>
           ${attrs ? `<div class="meta">${esc(attrs)}</div>` : ''}

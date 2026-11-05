@@ -52,14 +52,26 @@ const Auth = {
     if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
     return j;
   },
-  // 把图片相对路径（如 "2026/11/05/face-xxx.jpg"）或绝对 /media/ URL
-  // 变成带 token 的可访问 URL，供 <img src> 使用
-  mediaUrl(path) {
+  // mediaUrl: 传入图片相对路径（如 "2026/11/05/face-xxx.jpg"），返回带签名的临时 URL
+  // 签名 URL 15 分钟有效，浏览器原生 <img> 可直接访问，不能被长期复用
+  async mediaUrl(path) {
     if (!path) return '';
-    let url = path.startsWith('/') ? path : ('/media/' + path);
-    if (this.token) {
-      url += (url.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(this.token);
-    }
+    // 绝对 URL（http/https）直接返回
+    if (/^https?:\/\//i.test(path)) return path;
+    // 规范化相对路径，确保不带前导 /
+    let rel = path.replace(/^\/media\//, '').replace(/^\//, '');
+    try {
+      const r = await fetch('/api/media-url?path=' + encodeURIComponent(rel), {
+        headers: this._headers()
+      });
+      if (r.ok) {
+        const j = await r.json();
+        return j.url; // 形如 /media/xxx.jpg?sig=xxx&exp=xxx
+      }
+    } catch (e) { /* 忽略，fallback */ }
+    // Fallback：没登录或接口失败 → 退回用主 token query（但不推荐）
+    let url = '/media/' + rel;
+    if (this.token) url += '?token=' + encodeURIComponent(this.token);
     return url;
   },
   _headers(extra = {}) {

@@ -46,7 +46,12 @@ async function search(p = 1) {
       tbody.innerHTML = '<tr><td colspan="6" class="muted">没有匹配的记录。</td></tr>';
       return;
     }
-    tbody.innerHTML = data.items.map(e => {
+    // 批量换签名 URL
+    const signedItems = await Promise.all(data.items.map(async e => ({
+      ...e,
+      _signedImage: await Auth.mediaUrl(e.image)
+    })));
+    tbody.innerHTML = signedItems.map(e => {
       const isPlate = e.kind === 'plate';
       const labels = e.labels || [];
       const obj = isPlate
@@ -64,7 +69,7 @@ async function search(p = 1) {
           <td>${obj}${attrs ? `<div class="muted" style="font-size:11px;">${esc(attrs)}</div>` : ''}${e.sim ? `<div class="muted" style="font-size:11px;">相似度 ${(e.sim * 100).toFixed(1)}%</div>` : ''}</td>
           <td>${esc(e.address || '—')}</td>
           <td class="mono muted" style="font-size:11px;">${esc(fmtCoord(e.lat, e.lon) || '—')}</td>
-          <td><a href="${Auth.mediaUrl(e.image)}" target="_blank"><img class="thumb ${e.kind}" src="${Auth.mediaUrl(e.image)}" alt="" /></a></td>
+          <td><a href="${e._signedImage}" target="_blank"><img class="thumb ${e.kind}" src="${e._signedImage}" alt="" /></a></td>
         </tr>`;
     }).join('');
   } catch (e) {

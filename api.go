@@ -32,6 +32,7 @@ func NewServer(cfg Config, st *Store) http.Handler {
 
 	// —— 需登录 ——
 	s.mux.HandleFunc("POST /api/capture", requireAuth(s.handleCapture))
+	s.mux.HandleFunc("GET  /api/media-url", requireAuth(s.handleMediaSignedURL))
 
 	// —— 需登录 ——
 	s.mux.HandleFunc("GET /api/labels", requireAuth(s.handleLabels))
@@ -57,7 +58,7 @@ func NewServer(cfg Config, st *Store) http.Handler {
 	media := http.FileServer(http.Dir(filepath.Join(cfg.DataDir, "images")))
 	models := http.FileServer(http.Dir(cfg.ModelsDir))
 	reports := http.FileServer(http.Dir(filepath.Join(cfg.DataDir, "reports")))
-	s.mux.Handle("/media/", wrapCache(requireAuthHandler(http.StripPrefix("/media/", media)), "public, max-age=3600"))
+	s.mux.Handle("/media/", wrapCache(requireMediaAuth(http.StripPrefix("/media/", media)), "public, max-age=3600"))
 	// 模型文件与第三方依赖：immutable + 超长缓存，除非后端强制更换版本才失效
 	s.mux.Handle("/models/", wrapCache(http.StripPrefix("/models/", models), "public, max-age=31536000, immutable"))
 	s.mux.Handle("/vendor/", wrapCache(http.StripPrefix("/vendor/", vendor), "public, max-age=31536000, immutable"))
