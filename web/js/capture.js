@@ -444,9 +444,11 @@ const CAM_KEY = 'vi_camera_id';
 // visibilitychange + video.play + start() 授权成功可能在 500ms 内连续触发 3 次
 let _rcTimer = null;
 let _rcLastAuth = false;
+let _rcInProgress = false;  // 重入锁：防 iOS Safari tmp.stop() 触发 devicechange 形成并发
 function refreshCamerasDebounced(forceAuth = false) {
+  if (_rcInProgress) return;  // 正在跑就不再入队
   if (_rcTimer) clearTimeout(_rcTimer);
-  _rcLastAuth = _rcLastAuth || forceAuth;  // 期间有一次 forceAuth 就保留
+  _rcLastAuth = _rcLastAuth || forceAuth;
   _rcTimer = setTimeout(() => {
     const auth = _rcLastAuth;
     _rcTimer = null;
@@ -456,6 +458,9 @@ function refreshCamerasDebounced(forceAuth = false) {
 }
 
 async function refreshCameras(forceAuth = false) {
+  if (_rcInProgress) return;  // 防重入
+  _rcInProgress = true;
+  try {
   const sel = document.getElementById('selCamera');
   if (!sel) return;
   if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) {
@@ -469,16 +474,16 @@ async function refreshCameras(forceAuth = false) {
     sel.innerHTML = '<option value="">枚举失败：' + esc(e.message) + '</option>';
     return;
   }
-  // iOS Safari 特殊处理：没有活跃 getUserMedia 流时，enumerateDevices 返回空 label 甚至空列表
-  // 只有在用户手势内（forceAuth=true）才可以静默请求权限
   const needsAuth = !list.length || !list.some(d => d.label && d.label.trim());
   if (forceAuth && needsAuth) {
+    let tmp = null;
     try {
-      const tmp = await navigator.mediaDevices.getUserMedia({
+      tmp = await navigator.mediaDevices.getUserMedia({
         video: { facingMode: { ideal: 'environment' } }, audio: false
       });
+      // iOS Safari: 等一个 macrotask 让 AVFoundation 完全初始化好再枚举
+      await new Promise(r => setTimeout(r, 200));
       list = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'videoinput');
-      tmp.getTracks().forEach(t => t.stop());  // 立刻释放临时流
     } catch (e) {
       const msg = e.name === 'NotAllowedError'
         ? '⚠️ 未授权摄像头，请点击"启动摄像头"允许'
@@ -486,6 +491,9 @@ async function refreshCameras(forceAuth = false) {
         : '⚠️ 设备枚举受限：' + esc(e.message.slice(0, 40));
       sel.innerHTML = '<option value="">' + msg + '</option>';
       return;
+    } finally {
+      // iOS Safari: 延迟释放临时流 — stop 后立即枚举/DOM 操作会触发 devicechange 死循环
+      if (tmp) setTimeout(() => { tmp.getTracks().forEach(t => t.stop()); }, 500);
     }
   }
   if (!list.length) {
@@ -505,6 +513,7 @@ async function refreshCameras(forceAuth = false) {
     pick = rear ? rear.deviceId : list[list.length - 1].deviceId;
   }
   sel.value = pick;
+  } finally { _rcInProgress = false; }
 }
 
 // 刷新按钮（用户手势内 → forceAuth=true，能拿到真实设备名）
