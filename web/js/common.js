@@ -93,7 +93,7 @@ const api = {
     const j = await r.json().catch(() => ({}));
     if (r.status === 401) {
       Auth.token = '';
-      Auth.requireLogin();
+      // 只清 token，不自动跳转——让 UI 层（labels/search/stats 页面守卫）决定
       throw new Error('未登录');
     }
     if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));

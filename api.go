@@ -29,9 +29,10 @@ func NewServer(cfg Config, st *Store) http.Handler {
 	s.mux.HandleFunc("GET  /api/me", s.handleMe)
 	s.mux.HandleFunc("POST /api/password", s.handleChangePassword)
 	s.mux.HandleFunc("GET /api/health", s.handleHealth)
+	// /api/capture 保持公开：实时采集是核心功能，首页免登录也能上传（标签/检索/统计才要登录）
+	s.mux.HandleFunc("POST /api/capture", s.handleCapture)
 
 	// —— 需登录 ——
-	s.mux.HandleFunc("POST /api/capture", requireAuth(s.handleCapture))
 	s.mux.HandleFunc("GET  /api/media-url", requireAuth(s.handleMediaSignedURL))
 
 	// —— 需登录 ——
