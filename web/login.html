@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>vi · 登录</title>
+  <link rel="stylesheet" href="/css/style.css" />
+  <style>
+    .login-box {
+      max-width: 340px; margin: 10vh auto 0; padding: 32px 28px;
+      background: var(--panel); border: 1px solid var(--border);
+      border-radius: 14px; box-shadow: 0 8px 28px rgba(0,0,0,.25);
+    }
+    .login-box h1 { margin: 0 0 4px; font-size: 20px; }
+    .login-box .hint { margin-bottom: 20px; color: var(--muted); font-size: 13px; }
+    .login-box label { display: block; font-size: 12px; color: var(--muted); margin: 10px 0 4px; }
+    .login-box input {
+      width: 100%; padding: 9px 11px; font-size: 14px;
+      background: var(--bg-2, #181d1c); border: 1px solid var(--border);
+      border-radius: 8px; color: var(--text); outline: none;
+    }
+    .login-box input:focus { border-color: var(--accent); }
+    .login-box button {
+      width: 100%; margin-top: 16px; padding: 10px; font-size: 14px;
+    }
+    .login-box .err { color: #ff6f6f; font-size: 13px; margin-top: 10px; min-height: 18px; }
+    .login-box .back { margin-top: 14px; text-align: center; }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <div class="login-box">
+      <h1>vi · 见到你</h1>
+      <div class="hint">请登录后查看标签、检索、统计</div>
+
+      <label>用户名</label>
+      <input id="username" autocomplete="username" autofocus />
+
+      <label>密码</label>
+      <input id="password" type="password" autocomplete="current-password" />
+
+      <button class="btn primary" id="btnLogin">登 录</button>
+      <div class="err" id="errBox"></div>
+
+      <div class="back"><a href="/">返回实时监测</a></div>
+    </div>
+  </main>
+  <script src="/js/common.js"></script>
+  <script>
+    // 已登录 → 直接跳回
+    if (Auth.isLoggedIn()) {
+      const next = new URLSearchParams(location.search).get('next') || '/';
+      location.replace(next);
+    }
+    const $u = document.getElementById('username');
+    const $p = document.getElementById('password');
+    const $err = document.getElementById('errBox');
+    const $btn = document.getElementById('btnLogin');
+
+    async function doLogin() {
+      $err.textContent = '';
+      const username = $u.value.trim();
+      const password = $p.value;
+      if (!username || !password) { $err.textContent = '请填用户名和密码'; return; }
+      $btn.disabled = true; $btn.textContent = '登录中...';
+      try {
+        await Auth.login(username, password);
+        const next = new URLSearchParams(location.search).get('next') || '/';
+        location.replace(next);
+      } catch (e) {
+        $err.textContent = e.message || '登录失败';
+        $p.focus();
+      } finally {
+        $btn.disabled = false; $btn.textContent = '登 录';
+      }
+    }
+    $btn.addEventListener('click', doLogin);
+    $p.addEventListener('keydown', e => { if (e.key === 'Enter') doLogin(); });
+    $u.focus();
+  </script>
+</body>
+</html>
