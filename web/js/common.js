@@ -70,18 +70,22 @@ const Auth = {
           const j = await r.json();
           return j.url; // 形如 /media/xxx.jpg?sig=xxx&exp=xxx
         }
-      } catch (e) { /* 网络错误继续 fallback */ }
+        // 401 → token 过期/无效，清掉，不要再 fallback 用过期 token
+        if (r.status === 401) {
+          this.token = ''; // 触发 setter → localStorage.removeItem
+          // 不 return，继续往下走 fallback（此时 this.token 已清空）
+        }
+      } catch (e) { /* 网络错误：token 仍可能有效，fallback 用主 token */ }
     }
-    // Fallback：签名 URL 拿不到时 → 用主 token 做 query 参数（兼容后端 tokenFromHeader 的 query 兜底）
-    // 主 token 24h 有效，比签名 URL 更久但也更容易泄露（当前 15min 签名没拿到时的降级）
+    // Fallback：签名拿不到 → 如果还有主 token 就拼 query；没有就返回空字符串（由调用方处理）
     let url = '/media/' + rel;
     if (this.token) {
+      // 还有有效 token（网络错误导致签名失败，但 token 没过期）
       url += '?token=' + encodeURIComponent(this.token);
-    } else {
-      // 真的没登录 → 也拼上 token= 让后端 401（而不是 fallback 成无 token URL 直接 401 让 img 显示坏图）
-      url += '?token='; // 空 token → 后端 authenticate 失败 → 401
+      return url;
     }
-    return url;
+    // 真没 token / token 过期 → 返回空字符串让调用方处理（addFeed 会跳过 img 或显示占位）
+    return '';
   },
   _headers(extra = {}) {
     const h = { ...extra };

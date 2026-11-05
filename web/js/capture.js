@@ -49,8 +49,11 @@ async function addFeed(res, kind) {
   const signedUrl = await Auth.mediaUrl(e.image);
   const div = document.createElement('div');
   div.className = 'feed-item';
+  const imgHtml = signedUrl
+    ? `<img src="${signedUrl}" alt="" />`
+    : `<div class="img-placeholder" title="登录后可查看图片">🔒</div>`;
   div.innerHTML = `
-    <img src="${signedUrl}" alt="" />
+    ${imgHtml}
     <div>
       <div class="title">${esc(title)} <span class="badge ${kind}">${kind === 'plate' ? '车牌' : '人脸'}</span>
         ${e.labels && e.labels.length ? '<span class="badge beep">' + esc(e.labels.join('、')) + '</span>' : ''}</div>
@@ -186,8 +189,8 @@ async function faceLoop() {
       track._snap = f.snap;  // 最新对齐快照，供推理 worker 使用
       state.faceBoxes.push({ box: f.box, attrs: track.attrs });
 
-      // 排队推理：每 track 独立 3s 间隔，入队后不重复
-      if (!track.inferring && now - track.lastInfer >= 3000) {
+      // 排队推理：新 track 立即入队；已有的每 3s 间隔
+      if (!track.inferring && (track.lastInfer === 0 || now - track.lastInfer >= 3000)) {
         track.lastInfer = now;
         track.inferring = true;
         state.inferQueue.push(track);
