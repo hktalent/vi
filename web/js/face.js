@@ -1,4 +1,6 @@
 // 人脸链路：MediaPipe FaceLandmarker 检测 + 关键点对齐 + ArcFace 512 维特征
+// 注: _modelAB() Cache API 封装在 common.js 里，全局共享
+
 const FACE_REF = [
   [38.2946, 51.6963],
   [73.5318, 51.5014],
@@ -85,12 +87,19 @@ class FaceEngine {
     ort.env.logLevel = 'error';
 
     onStep && onStep('并行载入人脸模型 (ArcFace + 属性 ×3 + MediaPipe)...');
-    // 全部并行 fetch（Safari/Chrome 都会并发拉），各自缓存后 createSession
+    // 全部并行：先用 Cache API / 网络 fetch ArrayBuffer，再喂给 ORT（比直接传 URL 更快更可控）
+    // Cache API 持久化：第二次打开直接从磁盘读 → 零网络
+    const [arcAB, genderAB, ageAB, glassesAB] = await Promise.all([
+      _modelAB('/models/arc.onnx'),
+      _modelAB('/models/face_gender.onnx').catch(() => null),
+      _modelAB('/models/face_age.onnx').catch(() => null),
+      _modelAB('/models/face_glasses.onnx').catch(() => null),
+    ]);
     const [arc, gender, age, glasses] = await Promise.all([
-      ort.InferenceSession.create('/models/arc.onnx', { executionProviders: ['wasm'], graphOptimizationLevel: 'all' }),
-      ort.InferenceSession.create('/models/face_gender.onnx', { executionProviders: ['wasm'], graphOptimizationLevel: 'all' }).catch(() => null),
-      ort.InferenceSession.create('/models/face_age.onnx', { executionProviders: ['wasm'], graphOptimizationLevel: 'all' }).catch(() => null),
-      ort.InferenceSession.create('/models/face_glasses.onnx', { executionProviders: ['wasm'], graphOptimizationLevel: 'all' }).catch(() => null),
+      ort.InferenceSession.create(arcAB, { executionProviders: ['wasm'], graphOptimizationLevel: 'all' }),
+      genderAB ? ort.InferenceSession.create(genderAB, { executionProviders: ['wasm'], graphOptimizationLevel: 'all' }).catch(() => null) : Promise.resolve(null),
+      ageAB    ? ort.InferenceSession.create(ageAB,    { executionProviders: ['wasm'], graphOptimizationLevel: 'all' }).catch(() => null) : Promise.resolve(null),
+      glassesAB? ort.InferenceSession.create(glassesAB,{ executionProviders: ['wasm'], graphOptimizationLevel: 'all' }).catch(() => null) : Promise.resolve(null),
     ]);
     this.session = arc;
     this.inName = arc.inputNames[0];

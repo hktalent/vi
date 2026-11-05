@@ -94,6 +94,27 @@ const Auth = {
   }
 };
 
+// ── Cache API 持久化缓存模型文件 ──
+// 比浏览器 HTTP 缓存靠谱 N 倍：Safari/Chrome 都会存到磁盘，
+// 第二次打开页面直接从磁盘读 ArrayBuffer → 零网络、毫秒级
+// Safari 支持 Cache API（iOS 11+/macOS 10.13+）
+const _MODEL_CACHE = 'vi-models-v1';
+async function _modelAB(url) {
+  if (typeof caches === 'undefined') {
+    // 环境不支持 Cache API → 直接 fetch（退化为 HTTP 缓存）
+    return (await fetch(url)).arrayBuffer();
+  }
+  const cache = await caches.open(_MODEL_CACHE);
+  const hit = await cache.match(url);
+  if (hit) return hit.arrayBuffer();       // ✅ 命中磁盘缓存，零网络
+  const resp = await fetch(url);
+  if (resp.ok) {
+    await cache.put(url, resp.clone());     // 存入 Cache API
+    return resp.arrayBuffer();
+  }
+  throw new Error('模型下载失败 ' + url + ' HTTP ' + resp.status);
+}
+
 const api = {
   _buildInit(method, body) {
     const h = { ...(Auth._headers()), 'Content-Type': 'application/json' };

@@ -42,20 +42,22 @@ class PlateEngine {
       ? Math.min(4, navigator.hardwareConcurrency || 1) : 1;
     ort.env.logLevel = 'error';
     // proxy 模式下只支持 wasm EP（推理在 Worker 中执行，不阻塞画面）
-    onStep && onStep('载入车牌检测模型...');
-    this.det = await ort.InferenceSession.create('/models/plate_det.onnx', {
-      executionProviders: ['wasm'],
-      graphOptimizationLevel: 'all'
-    });
-    this.detInput = this.det.inputNames[0];
-    onStep && onStep('载入车牌识别模型...');
-    this.rec = await ort.InferenceSession.create('/models/plate_rec.onnx', {
-      executionProviders: ['wasm'],
-      graphOptimizationLevel: 'all'
-    });
-    this.recInput = this.rec.inputNames[0];
-    const arr = await (await fetch('/models/chars.json')).json();
-    this.chars = arr;
+    onStep && onStep('载入车牌模型...');
+    // 和人脸模型共用同一个 Cache API 持久化缓存
+    const [detAB, recAB, chars] = await Promise.all([
+      _modelAB('/models/plate_det.onnx'),
+      _modelAB('/models/plate_rec.onnx'),
+      (async () => (await (await fetch('/models/chars.json')).json()))(),
+    ]);
+    const [det, rec] = await Promise.all([
+      ort.InferenceSession.create(detAB, { executionProviders: ['wasm'], graphOptimizationLevel: 'all' }),
+      ort.InferenceSession.create(recAB, { executionProviders: ['wasm'], graphOptimizationLevel: 'all' }),
+    ]);
+    this.det = det;
+    this.rec = rec;
+    this.detInput = det.inputNames[0];
+    this.recInput = rec.inputNames[0];
+    this.chars = chars;
     this.ready = true;
     onStep && onStep('车牌模型就绪');
   }
@@ -67,7 +69,8 @@ class PlateEngine {
     } catch (e) {
       const url = which === 'det' ? '/models/plate_det.onnx' : '/models/plate_rec.onnx';
       console.warn('plate ' + which + ' 推理失败，重建 WASM session 重试:', e.message);
-      this[which] = await ort.InferenceSession.create(url, {
+      const ab = await _modelAB(url);
+      this[which] = await ort.InferenceSession.create(ab, {
         executionProviders: ['wasm'], graphOptimizationLevel: 'all'
       });
       if (which === 'det') this.detInput = this.det.inputNames[0];
