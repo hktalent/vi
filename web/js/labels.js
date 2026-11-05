@@ -1,18 +1,21 @@
 let page = 1;
 let total = 0;
 const PAGE_SIZE = 20;
-let selected = new Set(); // 选中的 event_id
+let kind = 'face'; // 当前身份类型 tab（人脸/车牌）
+let selected = new Set(); // 选中的 event_id（采集到的身份）
+let selectedLabels = new Set(); // 选中的标签 id（已有标签）
 
 async function loadLabels() {
   const tbody = document.getElementById('labelRows');
   try {
     const data = await api.get('/api/labels');
     if (!data.items.length) {
-      tbody.innerHTML = '<tr><td colspan="7" class="muted">还没有标签，先在下面的身份卡片里命名。</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="8" class="muted">还没有标签，先在下面的身份卡片里命名。</td></tr>';
       return;
     }
     tbody.innerHTML = data.items.map(l => `
       <tr>
+        <td><input type="checkbox" class="labelSelBox" data-id="${l.id}" ${selectedLabels.has(l.id) ? 'checked' : ''} /></td>
         <td><b>${esc(l.name)}</b></td>
         <td><span class="badge ${l.kind}">${l.kind === 'plate' ? '车牌' : '人脸'}</span></td>
         <td class="mono muted">${esc(l.target)}</td>
@@ -25,8 +28,16 @@ async function loadLabels() {
         <td><button class="btn small danger" data-del="${l.id}">删除</button></td>
       </tr>`).join('');
   } catch (e) {
-    tbody.innerHTML = `<tr><td colspan="7" class="muted">加载失败：${esc(e.message)}</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="8" class="muted">加载失败：${esc(e.message)}</td></tr>`;
   }
+}
+
+function updateLabelBatchBar() {
+  const has = selectedLabels.size > 0;
+  const btn = document.getElementById('btnDelLabels');
+  btn.style.display = has ? 'inline-block' : 'none';
+  if (has) btn.textContent = `删除选中 (${selectedLabels.size})`;
+  if (!has) document.getElementById('selAllLabels').checked = false;
 }
 
 function updateBatchBar() {
@@ -157,7 +168,7 @@ document.addEventListener('change', async ev => {
   } catch (e) { toast('更新失败：' + esc(e.message), 'err'); }
 });
 
-// 多选
+// 多选（采集到的身份）
 document.addEventListener('change', ev => {
   const box = ev.target.closest('.selBox');
   if (!box) return;
@@ -165,6 +176,41 @@ document.addEventListener('change', ev => {
   if (box.checked) selected.add(id);
   else selected.delete(id);
   updateBatchBar();
+});
+
+// 多选（已有标签）
+document.addEventListener('change', ev => {
+  const box = ev.target.closest('.labelSelBox');
+  if (!box) return;
+  const id = box.dataset.id;
+  if (box.checked) selectedLabels.add(id);
+  else selectedLabels.delete(id);
+  updateLabelBatchBar();
+});
+
+// 全选（已有标签）
+document.getElementById('selAllLabels').addEventListener('change', ev => {
+  document.querySelectorAll('.labelSelBox').forEach(cb => {
+    cb.checked = ev.target.checked;
+    if (ev.target.checked) selectedLabels.add(cb.dataset.id);
+    else selectedLabels.delete(cb.dataset.id);
+  });
+  updateLabelBatchBar();
+});
+
+// 批量删除标签
+document.getElementById('btnDelLabels').addEventListener('click', async () => {
+  if (!selectedLabels.size) return;
+  if (!confirm(`确定删除选中的 ${selectedLabels.size} 个标签？`)) return;
+  try {
+    for (const id of selectedLabels) {
+      await api.del('/api/labels/' + id);
+    }
+    toast(`已删除 ${selectedLabels.size} 个标签`);
+    selectedLabels.clear();
+    updateLabelBatchBar();
+    loadLabels();
+  } catch (e) { toast('删除失败：' + esc(e.message), 'err'); }
 });
 
 // 全选

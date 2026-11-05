@@ -1,0 +1,4 @@
+# gocv.io/x/gocv v0.38.0 => ./.build/gocv
+## explicit; go 1.21
+gocv.io/x/gocv
+# gocv.io/x/gocv => ./.build/gocv
