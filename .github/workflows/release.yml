@@ -115,18 +115,13 @@ jobs:
         shell: bash
         run: |
           if grep -qE '^[[:space:]]*replace[[:space:]]+.*=>[[:space:]]*/' go.mod; then
-            echo "::error::go.mod 中含有绝对路径 replace，请先执行 ./scripts/restore-gocv.sh 并提交干净的 go.mod"
+            echo "::error::go.mod 中含有绝对路径 replace，请先恢复为相对路径并提交干净的 go.mod"
             grep -nE '^[[:space:]]*replace' go.mod
             exit 1
           fi
 
-      - name: Prepare patched gocv
-        shell: bash
-        run: |
-          set -euo pipefail
-          ./scripts/patch-gocv.sh
-          grep -nE 'gocv\.io/x/gocv' go.mod
-
+      # vendor/ 已提交且内含 stub 化 gocv（videoio.cpp），go build 默认 -mod=vendor 直接使用，
+      # 无需也不能再跑 patch-gocv.sh（会改 go.mod 导致 inconsistent vendoring）
       - name: Build vi
         env:
           CGO_ENABLED: "1"
@@ -135,12 +130,6 @@ jobs:
         run: |
           mkdir -p dist/bin
           go build -tags importface -trimpath -ldflags "-s -w -X main.Version=${{ github.ref_name }}" -o dist/bin/vi${{ matrix.os == 'windows' && '.exe' || '' }} .
-
-      # 无论构建成败都恢复 go.mod，避免脏 go.mod 被带到下一步/被提交
-      - name: Restore go.mod
-        if: always()
-        shell: bash
-        run: ./scripts/restore-gocv.sh || true
 
       - name: Bundle OpenCV DLLs (Windows)
         if: matrix.os == 'windows'
@@ -155,16 +144,17 @@ jobs:
           set -euo pipefail
           os="${{ matrix.os }}"
           arch="${{ matrix.arch }}"
+          # qdrant 官方发布资产命名：qdrant-{arch}-{target}.{ext}（实测 v1.15.1）
           case "$os" in
-            darwin) qdrant_os="darwin"; ext="tar.gz" ;;
-            linux) qdrant_os="linux"; ext="tar.gz" ;;
-            windows) qdrant_os="windows"; ext="zip" ;;
+            darwin)  qdrant_target="apple-darwin"; ext="tar.gz" ;;
+            linux)   qdrant_target="unknown-linux-musl"; ext="tar.gz" ;;
+            windows) qdrant_target="pc-windows-msvc"; ext="zip" ;;
           esac
           case "$arch" in
             amd64) qdrant_arch="x86_64" ;;
             arm64) qdrant_arch="aarch64" ;;
           esac
-          asset="qdrant-${qdrant_arch}-unknown-${qdrant_os}-musl.${ext}"
+          asset="qdrant-${qdrant_arch}-${qdrant_target}.${ext}"
           url="https://github.com/qdrant/qdrant/releases/download/${QDRANT_VERSION}/${asset}"
           echo "Downloading $url"
           curl -fL "$url" -o "qdrant.${ext}"
@@ -174,9 +164,10 @@ jobs:
             zip) unzip -o "qdrant.${ext}" -d qdrant-dist ;;
           esac
           binpath=$(find qdrant-dist -type f -name "qdrant*" | head -n1)
+          qbin="qdrant"; [ "$os" = "windows" ] && qbin="qdrant.exe"
           mkdir -p dist/bin
-          cp "$binpath" "dist/bin/qdrant"
-          chmod +x dist/bin/qdrant || true
+          cp "$binpath" "dist/bin/$qbin"
+          chmod +x "dist/bin/$qbin" || true
 
       - name: Assemble package
         shell: bash
