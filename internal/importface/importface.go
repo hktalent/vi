@@ -1,3 +1,5 @@
+//go:build importface
+
 package importface
 
 import (
@@ -5,6 +7,7 @@ import (
 	"fmt"
 	"image"
 	"log"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -19,18 +22,23 @@ import (
 
 // Importer 把本地文件夹里的图片扫描一遍，检测人脸 → 裁剪 → 提取 embedding → upsert 到 Qdrant。
 type Importer struct {
-	cfg    config.Config
-	qd     *qdrant.Qdrant
-	st     *store.Store
-	cascade *gocv.CascadeClassifier
-	net     *gocv.Net
-	label   string // 可选标签，作为每张新脸的 PersonID 前缀
-	dryRun  bool
+	cfg      config.Config
+	qd       *qdrant.Qdrant
+	st       *store.Store
+	cascade  *gocv.CascadeClassifier
+	net      *gocv.Net
+	label    string // 可选标签，作为每张新脸的 PersonID 前缀
+	dryRun   bool
+	force    bool              // 强制重新导入（忽略已有记录）
+	existing map[string]bool   // 已导入的 person_id 集合（幂等去重）
+	skipped  int               // 跳过数量统计
+	filtered int               // 被 norm 过滤丢弃的数量统计
 }
 
 // NewImporter 创建 Importer。
 // cascadeXML 是 OpenCV Haar cascade 路径（检测人脸用），arcOnnx 是 arc.onnx 路径（提取 embedding 用）。
-func NewImporter(cfg config.Config, qd *qdrant.Qdrant, st *store.Store, cascadeXML, arcOnnx, label string, dryRun bool) (*Importer, error) {
+// force=true 时忽略已有导入记录，全部重新导入。
+func NewImporter(cfg config.Config, qd *qdrant.Qdrant, st *store.Store, cascadeXML, arcOnnx, label string, dryRun, force bool) (*Importer, error) {
 	cc := gocv.NewCascadeClassifier()
 	if !cc.Load(cascadeXML) {
 		return nil, fmt.Errorf("加载 Haar cascade 失败: %s", cascadeXML)
@@ -40,7 +48,16 @@ func NewImporter(cfg config.Config, qd *qdrant.Qdrant, st *store.Store, cascadeX
 		return nil, fmt.Errorf("加载 arc.onnx 失败: %s", arcOnnx)
 	}
 	log.Printf("[import] OpenCV DNN 已加载 arc.onnx")
-	return &Importer{cfg: cfg, qd: qd, st: st, cascade: &cc, net: &net, label: label, dryRun: dryRun}, nil
+	im := &Importer{cfg: cfg, qd: qd, st: st, cascade: &cc, net: &net, label: label, dryRun: dryRun, force: force}
+
+	// 加载已有 person_id 集合（幂等去重）
+	if st != nil && !force {
+		im.existing = st.ExistingPersonIDs("import_")
+		if len(im.existing) > 0 {
+			log.Printf("[import] 发现 %d 条已导入记录，将跳过（-force 可强制重导）", len(im.existing))
+		}
+	}
+	return im, nil
 }
 
 // Run 递归扫描 dir，导入所有图片。返回导入的人脸数量。
@@ -79,7 +96,8 @@ func (im *Importer) Run(dir string) (int, error) {
 		success += faces
 	}
 	fmt.Fprintln(os.Stderr)
-	log.Printf("[import] 完成: %d 张图片 → %d 张人脸成功 / %d 张图片处理失败", len(imagePaths), success, failed)
+	log.Printf("[import] 完成: %d 张图片 → %d 张新人脸导入 / %d 张已存在跳过 / %d 张误检过滤 / %d 张图片处理失败",
+		len(imagePaths), success, im.skipped, im.filtered, failed)
 	if firstErr != nil {
 		return success, firstErr
 	}
@@ -106,7 +124,8 @@ func (im *Importer) processImage(path string) (int, error) {
 	}
 
 	// 人脸检测（Haar cascade）
-	rects := im.cascade.DetectMultiScaleWithParams(detectImg, 1.1, 4, 0, image.Pt(30, 30), image.Pt(0, 0))
+	// scaleFactor=1.2（更严格）, minNeighbors=6（减少误检）, minSize=50（过滤小区域）
+	rects := im.cascade.DetectMultiScaleWithParams(detectImg, 1.2, 6, 0, image.Pt(50, 50), image.Pt(0, 0))
 	im.writeFacesLog(path, len(rects))
 
 	if len(rects) == 0 {
@@ -115,6 +134,13 @@ func (im *Importer) processImage(path string) (int, error) {
 
 	saved := 0
 	for i, r := range rects {
+		// 幂等检查：personID 确定性地从路径+索引生成，同一张图同一张脸每次运行结果相同
+		personID := newPersonID(im.label, path, i)
+		if !im.force && im.existing != nil && im.existing[personID] {
+			im.skipped++
+			continue
+		}
+
 		// 坐标还原到原始图
 		x := int(float64(r.Min.X) / detectScale)
 		y := int(float64(r.Min.Y) / detectScale)
@@ -153,8 +179,16 @@ func (im *Importer) processImage(path string) (int, error) {
 			continue
 		}
 
+		// embedding L2 范数过滤：非人脸区域（花纹/布料/手写）的范数通常异常
+		norm := l2Norm(embedding)
+		if norm > 8.0 || norm < 1.5 {
+			im.filtered++
+			crop.Close()
+			continue
+		}
+
 		// 保存抠图
-		rel, err := im.saveFaceCrop(path, i, x, y, w, h, cropRect, crop)
+		rel, err := im.saveFaceCrop(path, personID, crop)
 		crop.Close()
 		if err != nil {
 			log.Printf("[import] 保存抠图失败: %v", err)
@@ -165,7 +199,6 @@ func (im *Importer) processImage(path string) (int, error) {
 			continue
 		}
 
-		personID := newPersonID(im.label, path, i)
 		if im.st != nil {
 			// 通过 Store 统一写入：Event（前端可见） + Qdrant（向量搜索）
 			if _, err := im.st.ImportFace(personID, embedding, rel, path, time.Now().In(im.cfg.Location)); err != nil {
@@ -280,23 +313,21 @@ func matToFloat32(m gocv.Mat) ([]float32, error) {
 }
 
 // saveFaceCrop 把人脸抠图落盘到 data/images/import/ 目录。
-func (im *Importer) saveFaceCrop(srcPath string, idx, x, y, w, h int, rect image.Rectangle, crop gocv.Mat) (string, error) {
+// 文件名基于 personID（确定性），同一张图同一张脸多次运行生成相同文件名，不会重复保存。
+func (im *Importer) saveFaceCrop(srcPath string, personID string, crop gocv.Mat) (string, error) {
 	ext := strings.ToLower(filepath.Ext(srcPath))
 	switch ext {
-	case ".jpeg":
-		ext = ".jpg"
-	case ".webp":
-		ext = ".jpg" // OpenCV 不直接写 webp
-	case ".heic":
-		ext = ".jpg"
-	case "":
+	case ".jpeg", ".webp", ".heic", "":
 		ext = ".jpg"
 	}
-	rel := filepath.Join("import", fmt.Sprintf("%s_f%d_%.3f_%.3f%s",
-		filepath.Base(srcPath), idx, float64(x)/100, float64(y)/100, ext))
+	rel := filepath.Join("import", personID+ext)
 	full := filepath.Join(im.cfg.DataDir, "images", rel)
 	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
 		return "", err
+	}
+	// 文件已存在且内容未变 → 跳过（幂等）
+	if _, err := os.Stat(full); err == nil {
+		return rel, nil
 	}
 	target := gocv.NewMat()
 	gocv.Resize(crop, &target, image.Pt(160, 160), 0, 0, gocv.InterpolationLinear)
@@ -367,6 +398,15 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// l2Norm 计算 float32 切片的 L2 范数。
+func l2Norm(v []float32) float64 {
+	var sum float64
+	for _, x := range v {
+		sum += float64(x) * float64(x)
+	}
+	return math.Sqrt(sum)
 }
 
 // uuid4 生成一个 UUID v4 字符串（随机 122 bit + 固定 version/variant）。

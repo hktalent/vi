@@ -184,6 +184,7 @@ vi/
 ```bash
 cd vi/
 ./start.sh
+./impt.sh "/Users/51pwn/Documents/M_T_X/婚礼" "婚礼照片"
 # → 自动编译 Go 源码 → 启动 Qdrant (6333) → 启动 vi (8688)
 # → 浏览器打开 http://127.0.0.1:8688
 ```

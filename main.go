@@ -8,14 +8,12 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"time"
 
 	"vi/internal/api"
 	"vi/internal/auth"
 	"vi/internal/config"
 	"vi/internal/geo"
-	"vi/internal/importface"
 	"vi/internal/qdrant"
 	"vi/internal/report"
 	"vi/internal/store"
@@ -76,6 +74,9 @@ func loadConfig() config.Config {
 	return c
 }
 
+/*
+go build -trimpath -o ./bin/vi -ldflags "-s -w" main.go
+*/
 func main() {
 	// 子命令分支
 	if len(os.Args) > 1 {
@@ -83,7 +84,11 @@ func main() {
 		case "serve":
 			os.Exit(runServe())
 		case "importfaces", "import":
-			os.Exit(runImportFaces(os.Args[2:]))
+			fmt.Fprintln(os.Stderr, "importfaces 子命令需要编译时加 -tags importface（需要 CGO + OpenCV）")
+			fmt.Fprintln(os.Stderr, "本地构建: ./build-importface.sh")
+			os.Exit(1)
+		case "reset":
+			os.Exit(runReset(os.Args[2:]))
 		case "version", "--version", "-v":
 			fmt.Println("vi", Version)
 			return
@@ -101,7 +106,8 @@ func printUsage() {
 	fmt.Println()
 	fmt.Println("用法:")
 	fmt.Println("  vi serve [flags]              启动 HTTP 服务")
-	fmt.Println("  vi importfaces [flags] -dir   导入本地图片（扫描文件夹、检测人脸、提取特征、upsert Qdrant）")
+	fmt.Println("  vi importfaces [flags] -dir   导入本地图片（需 -tags importface 编译）")
+	fmt.Println("  vi reset [-data dir]          清空所有数据（事件、抠图、向量）")
 	fmt.Println("  vi version                    打印版本")
 	fmt.Println("  vi help                       打印本帮助")
 	fmt.Println()
@@ -155,119 +161,69 @@ func runServe() int {
 	return 0
 }
 
-// runImportFaces 实现 vi importfaces 子命令。
-// 扫描 -dir 指定目录递归，Haar cascade 检测人脸 → arc.onnx 提取 embedding → upsert 到 Qdrant。
+// runReset 清空所有数据：events.jsonl、抠图文件、Qdrant 向量。
+// 用于重新导入前的清理。
 //
-//	vi importfaces -dir "/path/to/photos" [-label "婚礼"] [-dry-run] [-cascade path] [-arc path] [-qdrant url]
-func runImportFaces(args []string) int {
-	fs := flag.NewFlagSet("importfaces", flag.ExitOnError)
-	dir := fs.String("dir", "", "图片目录（必填，递归扫描所有子目录）")
-	label := fs.String("label", "", "可选标签，作为 PersonID 前缀（如 \"婚礼\"、\"团建\"）")
-	dryRun := fs.Bool("dry-run", false, "只扫描+检测，不上传 Qdrant")
-	cascade := fs.String("cascade", "", "Haar cascade XML 路径（默认自动搜索 OpenCV 安装路径）")
-	arc := fs.String("arc", "", "arc.onnx 路径（默认 ./models/arc.onnx）")
+//	vi reset [-data dir] [-qdrant url] [-face-collection name] [-plate-collection name] [-yes]
+func runReset(args []string) int {
+	fs := flag.NewFlagSet("reset", flag.ExitOnError)
+	dataDir := fs.String("data", env("VI_DATA", "data"), "数据目录")
 	qdURL := fs.String("qdrant", env("VI_QDRANT", "http://127.0.0.1:6333"), "Qdrant 地址")
 	faceCol := fs.String("face-collection", env("VI_FACE_COLLECTION", "vi_faces"), "人脸集合名")
-	dataDir := fs.String("data", env("VI_DATA", "data"), "数据目录（保存抠图）")
-	modelsDir := fs.String("models", env("VI_MODELS", "models"), "模型目录")
+	plateCol := fs.String("plate-collection", env("VI_PLATE_COLLECTION", "vi_plates"), "车牌集合名")
+	yes := fs.Bool("yes", false, "跳过确认直接执行")
 	if err := fs.Parse(args); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 2
 	}
-	if *dir == "" {
-		fmt.Fprintln(os.Stderr, "错误: 必须指定 -dir 参数")
-		fmt.Fprintln(os.Stderr, "用法: vi importfaces -dir \"/path/to/photos\" [-label 婚礼]")
-		return 2
-	}
 
-	log.SetFlags(log.LstdFlags | log.Lshortfile)
-
-	// 解析级联分类器路径
-	cascadePath := *cascade
-	if cascadePath == "" {
-		cascadePath = findHaarCascade()
-	}
-	if _, err := os.Stat(cascadePath); err != nil {
-		log.Fatalf("Haar cascade 文件不存在: %s", cascadePath)
-	}
-
-	// 解析 arc.onnx 路径
-	arcPath := *arc
-	if arcPath == "" {
-		arcPath = filepath.Join(*modelsDir, "arc.onnx")
-	}
-	if _, err := os.Stat(arcPath); err != nil {
-		log.Fatalf("arc.onnx 模型不存在: %s", arcPath)
-	}
-
-	if err := os.MkdirAll(*dataDir, 0o755); err != nil {
-		log.Fatalf("创建数据目录失败: %v", err)
-	}
-
-	cfg := config.Config{DataDir: *dataDir, ModelsDir: *modelsDir, Location: time.FixedZone("CST", 8*3600)}
-	qd := qdrant.NewQdrant(*qdURL, *faceCol, env("VI_PLATE_COLLECTION", "vi_plates"))
-	if err := qd.Ensure(); err != nil {
-		log.Printf("[warn] Qdrant 不可用（dry-run 跳过或返回空）: %v", err)
-		if !*dryRun {
-			log.Fatalf("Qdrant 连接失败，请先启动 Qdrant 或使用 -dry-run")
+	if !*yes {
+		fmt.Printf("⚠️  将清空以下数据:\n")
+		fmt.Printf("   事件文件: %s/events.jsonl\n", *dataDir)
+		fmt.Printf("   抠图目录: %s/images/\n", *dataDir)
+		fmt.Printf("   Qdrant:   %s 集合 %s / %s\n", *qdURL, *faceCol, *plateCol)
+		fmt.Printf("\n确认执行? 输入 yes 继续: ")
+		var confirm string
+		fmt.Scanln(&confirm)
+		if confirm != "yes" {
+			fmt.Println("已取消")
+			return 0
 		}
 	}
 
-	// 创建 Store 实例（写 events.jsonl + Qdrant），让导入的人脸在前端可见
-	var st *store.Store
-	if !*dryRun {
-		g := geo.NewGeocoder("", "", filepath.Join(cfg.DataDir, "geo_cache.json"))
-		var err error
-		st, err = store.NewStore(cfg, qd, g)
+	// 1. 清空事件文件
+	eventsFile := filepath.Join(*dataDir, "events.jsonl")
+	if err := os.Truncate(eventsFile, 0); err != nil && !os.IsNotExist(err) {
+		log.Printf("[reset] 清空 events.jsonl 失败: %v", err)
+	} else {
+		log.Printf("[reset] ✅ events.jsonl 已清空")
+	}
+
+	// 2. 清空抠图目录
+	imagesDir := filepath.Join(*dataDir, "images")
+	if err := os.RemoveAll(imagesDir); err != nil {
+		log.Printf("[reset] 删除 images 目录失败: %v", err)
+	} else {
+		log.Printf("[reset] ✅ images/ 已删除")
+	}
+
+	// 3. 清空 Qdrant 集合
+	for _, col := range []string{*faceCol, *plateCol} {
+		url := fmt.Sprintf("%s/collections/%s", *qdURL, col)
+		req, _ := http.NewRequest("DELETE", url, nil)
+		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
-			log.Printf("[warn] Store 初始化失败（导入的人脸不会出现在事件列表）: %v", err)
+			log.Printf("[reset] 删除 Qdrant 集合 %s 失败: %v", col, err)
+			continue
+		}
+		resp.Body.Close()
+		if resp.StatusCode == 200 {
+			log.Printf("[reset] ✅ Qdrant 集合 %s 已删除", col)
+		} else {
+			log.Printf("[reset] Qdrant 集合 %s 删除返回 %d", col, resp.StatusCode)
 		}
 	}
 
-	imp, err := importface.NewImporter(cfg, qd, st, cascadePath, arcPath, *label, *dryRun)
-	if err != nil {
-		log.Fatalf("初始化 Importer 失败: %v", err)
-	}
-
-	log.Printf("[import] 目录: %s", *dir)
-	log.Printf("[import] Haar cascade: %s", cascadePath)
-	log.Printf("[import] arc.onnx: %s", arcPath)
-	log.Printf("[import] Qdrant: %s 集合: %s", *qdURL, *faceCol)
-	if *label != "" {
-		log.Printf("[import] 标签: %s", *label)
-	}
-	if *dryRun {
-		log.Printf("[import] ⚠️ dry-run 模式：只扫描，不上传 Qdrant")
-	}
-
-	n, err := imp.Run(*dir)
-	if err != nil {
-		log.Printf("[import] 有错误（部分成功）: %v", err)
-	}
-	fmt.Printf("\n✅ 导入完成：%d 张新人脸\n", n)
-	if strings.HasPrefix(*qdURL, "http://127.0.0.1") {
-		fmt.Println("💡 启动 vi serve 后即可在首页看到导入的人脸作为同一性识别")
-	}
+	fmt.Println("\n✅ 所有数据已清空。启动 vi serve 后会自动重建空集合。")
 	return 0
-}
-
-// findHaarCascade 在常见 OpenCV 安装路径中搜索 haarcascade_frontalface_default.xml。
-func findHaarCascade() string {
-	candidates := []string{
-		// Homebrew
-		"/usr/local/share/opencv4/haarcascades/haarcascade_frontalface_default.xml",
-		"/opt/homebrew/share/opencv4/haarcascades/haarcascade_frontalface_default.xml",
-		"/usr/local/Cellar/opencv/4.11.0_1/share/opencv4/haarcascades/haarcascade_frontalface_default.xml",
-		// 其他常见路径
-		"/usr/share/opencv4/haarcascades/haarcascade_frontalface_default.xml",
-		"/usr/local/opt/opencv/share/opencv4/haarcascades/haarcascade_frontalface_default.xml",
-		// 相对路径 fallback
-		filepath.Join("models", "haarcascade_frontalface_default.xml"),
-	}
-	for _, c := range candidates {
-		if _, err := os.Stat(c); err == nil {
-			return c
-		}
-	}
-	return candidates[0] // 找不到返回第一个，让后续 stat 报错
 }

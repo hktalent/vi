@@ -370,6 +370,20 @@ func (s *Store) ImportFace(personID string, vec []float32, imagePath, sourcePath
 	return e, nil
 }
 
+// ExistingPersonIDs 返回所有 person_id 以 prefix 开头的事件集合。
+// 用于 importfaces 幂等判断：已导入过的人脸跳过不重复导入。
+func (s *Store) ExistingPersonIDs(prefix string) map[string]bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := map[string]bool{}
+	for _, e := range s.events {
+		if strings.HasPrefix(e.PersonID, prefix) {
+			out[e.PersonID] = true
+		}
+	}
+	return out
+}
+
 // normalizePlate 把车牌号规整为大写无空格（内部使用）。
 func normalizePlate(s string) string {
 	s = strings.ToUpper(strings.TrimSpace(s))
