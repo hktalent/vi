@@ -310,30 +310,32 @@ function drawLoop() {
 }
 
 async function loadEngines() {
+  // 人脸 + 车牌引擎并行初始化（各自内部已经是 Promise.all 并行拉模型文件）
+  // Safari/Chrome 都会并发发请求，总耗时 = max(人脸init, 车牌init) 而非 sum
+  const jobs = [];
   if (!state.face) {
     state.face = new FaceEngine();
-    try {
-      await state.face.init(msg => setChip('chipFace', null, msg));
-      setChip('chipFace', true, '人脸模型就绪');
-    } catch (e) {
-      setChip('chipFace', false, '人脸模型失败');
-      toast('人脸模型加载失败：' + esc(e.message), 'err', 6000);
-      console.error(e);
-      state.face = null;
-    }
+    jobs.push(state.face.init(msg => setChip('chipFace', null, msg))
+      .then(() => { setChip('chipFace', true, '人脸模型就绪'); })
+      .catch(e => {
+        setChip('chipFace', false, '人脸模型失败');
+        toast('人脸模型加载失败：' + esc(e.message), 'err', 6000);
+        console.error(e);
+        state.face = null;
+      }));
   }
   if (!state.plate) {
     state.plate = new PlateEngine();
-    try {
-      await state.plate.init(msg => setChip('chipPlate', null, msg));
-      setChip('chipPlate', true, '车牌模型就绪');
-    } catch (e) {
-      setChip('chipPlate', false, '车牌模型失败');
-      toast('车牌模型加载失败：' + esc(e.message), 'err', 6000);
-      console.error(e);
-      state.plate = null;
-    }
+    jobs.push(state.plate.init(msg => setChip('chipPlate', null, msg))
+      .then(() => { setChip('chipPlate', true, '车牌模型就绪'); })
+      .catch(e => {
+        setChip('chipPlate', false, '车牌模型失败');
+        toast('车牌模型加载失败：' + esc(e.message), 'err', 6000);
+        console.error(e);
+        state.plate = null;
+      }));
   }
+  await Promise.all(jobs);
 }
 
 async function start() {

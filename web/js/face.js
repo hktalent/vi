@@ -84,26 +84,22 @@ class FaceEngine {
     ort.env.wasm.proxy = true;
     ort.env.logLevel = 'error';
 
-    onStep && onStep('载入 ArcFace (ONNX)...');
-    // proxy 模式只支持 wasm EP（webgpu 不支持），ArcFace 在 wasm 上约 0.3s
-    this.session = await ort.InferenceSession.create('/models/arc.onnx', {
-      executionProviders: ['wasm'],
-      graphOptimizationLevel: 'all'
-    });
-    this.inName = this.session.inputNames[0];
-    this.outName = this.session.outputNames[0];
-    this.provider = (this.session.executionProviders && this.session.executionProviders()?.[0]) || '';
-
-    onStep && onStep('载入人脸属性模型 (FairFace INT8 ×2 + 眼镜分类)...');
-    // 注意: INT8 量化模型(MatMulInteger/DynamicQuantizeLinear)在 ORT Web WebGPU 上输出错误，强制 WASM
-    const loadAttr = p => ort.InferenceSession.create('/models/' + p, {
-      executionProviders: ['wasm'], graphOptimizationLevel: 'all'
-    }).catch(e => { console.warn('属性模型加载失败 ' + p, e); return null; });
-    [this.sessGender, this.sessAge, this.sessGlasses] = await Promise.all([
-      loadAttr('face_gender.onnx'), loadAttr('face_age.onnx'), loadAttr('face_glasses.onnx')
+    onStep && onStep('并行载入人脸模型 (ArcFace + 属性 ×3 + MediaPipe)...');
+    // 全部并行 fetch（Safari/Chrome 都会并发拉），各自缓存后 createSession
+    const [arc, gender, age, glasses] = await Promise.all([
+      ort.InferenceSession.create('/models/arc.onnx', { executionProviders: ['wasm'], graphOptimizationLevel: 'all' }),
+      ort.InferenceSession.create('/models/face_gender.onnx', { executionProviders: ['wasm'], graphOptimizationLevel: 'all' }).catch(() => null),
+      ort.InferenceSession.create('/models/face_age.onnx', { executionProviders: ['wasm'], graphOptimizationLevel: 'all' }).catch(() => null),
+      ort.InferenceSession.create('/models/face_glasses.onnx', { executionProviders: ['wasm'], graphOptimizationLevel: 'all' }).catch(() => null),
     ]);
+    this.session = arc;
+    this.inName = arc.inputNames[0];
+    this.outName = arc.outputNames[0];
+    this.provider = (arc.executionProviders && arc.executionProviders()?.[0]) || '';
+    this.sessGender = gender;
+    this.sessAge = age;
+    this.sessGlasses = glasses;
 
-    onStep && onStep('载入 MediaPipe FaceLandmarker...');
     const vision = await import('/vendor/mp/vision_bundle.mjs');
     const fileset = await vision.FilesetResolver.forVisionTasks('/vendor/mp/wasm');
     // GPU delegate 在部分机器的 ANGLE/Metal 上会导致 WebGL 上下文丢失（检测直接失效甚至拖崩系统），
