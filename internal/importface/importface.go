@@ -25,6 +25,7 @@ type Importer struct {
 	cfg        config.Config
 	qd         *qdrant.Qdrant
 	st         *store.Store
+	yunet      *YuNetDetector          // 优先使用的 DNN 检测器（nil 时回退 Haar）
 	cascade    *gocv.CascadeClassifier
 	cascadeAlt *gocv.CascadeClassifier // 第二投票 cascade
 	cascadeAlt2 *gocv.CascadeClassifier // 第三投票 cascade
@@ -40,40 +41,57 @@ type Importer struct {
 }
 
 // NewImporter 创建 Importer。
-// cascadeXML 是 OpenCV Haar cascade 路径（检测人脸用），arcOnnx 是 arc.onnx 路径（提取 embedding 用）。
+// yunetPath 是 YuNet 检测模型路径（face_detection_yunet_2023mar.onnx），存在时优先于 Haar cascade。
+// cascadeXML 是 OpenCV Haar cascade 路径（YuNet 缺失时的回退检测器），arcOnnx 是 arc.onnx 路径（提取 embedding 用）。
 // force=true 时忽略已有导入记录，全部重新导入。
-func NewImporter(cfg config.Config, qd *qdrant.Qdrant, st *store.Store, cascadeXML, arcOnnx, label string, dryRun, force bool) (*Importer, error) {
-	cc := gocv.NewCascadeClassifier()
-	if !cc.Load(cascadeXML) {
-		return nil, fmt.Errorf("加载 Haar cascade 失败: %s", cascadeXML)
+func NewImporter(cfg config.Config, qd *qdrant.Qdrant, st *store.Store, cascadeXML, arcOnnx, yunetPath, label string, dryRun, force bool) (*Importer, error) {
+	im := &Importer{cfg: cfg, qd: qd, st: st, label: label, dryRun: dryRun, force: force}
+
+	// 检测器：优先 YuNet（DNN，准确率高且输出 5 点关键点）；加载失败回退 Haar cascade
+	if yunetPath != "" {
+		if yd, err := NewYuNetDetector(yunetPath); err == nil {
+			im.yunet = yd
+			log.Printf("[import] 使用 YuNet 人脸检测器: %s", yunetPath)
+		} else {
+			log.Printf("[import] ⚠️  %v，回退 Haar cascade", err)
+		}
 	}
-	// 加载第二、第三投票 cascade（同目录）
-	cascadeDir := filepath.Dir(cascadeXML)
-	ccAlt := gocv.NewCascadeClassifier()
-	if !ccAlt.Load(filepath.Join(cascadeDir, "haarcascade_frontalface_alt.xml")) {
-		log.Printf("[import] ⚠️  alt cascade 加载失败，投票降级为单 cascade")
+
+	if im.yunet == nil {
+		cc := gocv.NewCascadeClassifier()
+		if !cc.Load(cascadeXML) {
+			return nil, fmt.Errorf("加载 Haar cascade 失败: %s", cascadeXML)
+		}
+		// 加载第二、第三投票 cascade（同目录）
+		cascadeDir := filepath.Dir(cascadeXML)
+		ccAlt := gocv.NewCascadeClassifier()
+		if !ccAlt.Load(filepath.Join(cascadeDir, "haarcascade_frontalface_alt.xml")) {
+			log.Printf("[import] ⚠️  alt cascade 加载失败，投票降级为单 cascade")
+		}
+		ccAlt2 := gocv.NewCascadeClassifier()
+		if !ccAlt2.Load(filepath.Join(cascadeDir, "haarcascade_frontalface_alt2.xml")) {
+			log.Printf("[import] ⚠️  alt2 cascade 加载失败，投票降级为单 cascade")
+		}
+		// 从 face cascade 路径推导 eye/mouth cascade 路径（同目录）
+		eyeXML := filepath.Join(cascadeDir, "haarcascade_eye.xml")
+		ec := gocv.NewCascadeClassifier()
+		if !ec.Load(eyeXML) {
+			return nil, fmt.Errorf("加载 eye cascade 失败: %s", eyeXML)
+		}
+		mouthXML := filepath.Join(cascadeDir, "haarcascade_smile.xml")
+		mc := gocv.NewCascadeClassifier()
+		if !mc.Load(mouthXML) {
+			return nil, fmt.Errorf("加载 mouth cascade 失败: %s", mouthXML)
+		}
+		im.cascade, im.cascadeAlt, im.cascadeAlt2, im.eyeCascade, im.mouthCascade = &cc, &ccAlt, &ccAlt2, &ec, &mc
 	}
-	ccAlt2 := gocv.NewCascadeClassifier()
-	if !ccAlt2.Load(filepath.Join(cascadeDir, "haarcascade_frontalface_alt2.xml")) {
-		log.Printf("[import] ⚠️  alt2 cascade 加载失败，投票降级为单 cascade")
-	}
-	// 从 face cascade 路径推导 eye/mouth cascade 路径（同目录）
-	eyeXML := filepath.Join(cascadeDir, "haarcascade_eye.xml")
-	ec := gocv.NewCascadeClassifier()
-	if !ec.Load(eyeXML) {
-		return nil, fmt.Errorf("加载 eye cascade 失败: %s", eyeXML)
-	}
-	mouthXML := filepath.Join(cascadeDir, "haarcascade_smile.xml")
-	mc := gocv.NewCascadeClassifier()
-	if !mc.Load(mouthXML) {
-		return nil, fmt.Errorf("加载 mouth cascade 失败: %s", mouthXML)
-	}
+
 	net := gocv.ReadNetFromONNX(arcOnnx)
 	if net.Empty() {
 		return nil, fmt.Errorf("加载 arc.onnx 失败: %s", arcOnnx)
 	}
 	log.Printf("[import] OpenCV DNN 已加载 arc.onnx")
-	im := &Importer{cfg: cfg, qd: qd, st: st, cascade: &cc, cascadeAlt: &ccAlt, cascadeAlt2: &ccAlt2, eyeCascade: &ec, mouthCascade: &mc, net: &net, label: label, dryRun: dryRun, force: force}
+	im.net = &net
 
 	// 加载已有 person_id 集合（幂等去重）
 	if st != nil && !force {
@@ -137,20 +155,27 @@ func (im *Importer) processImage(path string) (int, error) {
 	}
 	defer img.Close()
 
-	// 缩小图用于检测（加速 + 降低误检）
+	// 人脸检测：YuNet（DNN，输出原图坐标）优先；否则 Haar cascade（输出缩放图坐标）
 	detectScale := 1.0
-	detectImg := img.Clone()
-	const maxDetectDim = 1280
-	if max(img.Rows(), img.Cols()) > maxDetectDim {
-		detectScale = float64(maxDetectDim) / float64(max(img.Rows(), img.Cols()))
-		newW := int(float64(img.Cols()) * detectScale)
-		newH := int(float64(img.Rows()) * detectScale)
-		gocv.Resize(img, &detectImg, image.Pt(newW, newH), 0, 0, gocv.InterpolationLinear)
+	var rects []image.Rectangle
+	if im.yunet != nil {
+		for _, f := range im.yunet.Detect(img) {
+			rects = append(rects, f.Rect)
+		}
+	} else {
+		// 缩小图用于检测（加速 + 降低误检）
+		detectImg := img.Clone()
+		const maxDetectDim = 1280
+		if max(img.Rows(), img.Cols()) > maxDetectDim {
+			detectScale = float64(maxDetectDim) / float64(max(img.Rows(), img.Cols()))
+			newW := int(float64(img.Cols()) * detectScale)
+			newH := int(float64(img.Rows()) * detectScale)
+			gocv.Resize(img, &detectImg, image.Pt(newW, newH), 0, 0, gocv.InterpolationLinear)
+		}
+		// scaleFactor=1.2（更严格）, minNeighbors=6（减少误检）, minSize=50（过滤小区域）
+		rects = im.cascade.DetectMultiScaleWithParams(detectImg, 1.2, 6, 0, image.Pt(50, 50), image.Pt(0, 0))
+		detectImg.Close()
 	}
-
-	// 人脸检测（Haar cascade）
-	// scaleFactor=1.2（更严格）, minNeighbors=6（减少误检）, minSize=50（过滤小区域）
-	rects := im.cascade.DetectMultiScaleWithParams(detectImg, 1.2, 6, 0, image.Pt(50, 50), image.Pt(0, 0))
 	im.writeFacesLog(path, len(rects))
 
 	if len(rects) == 0 {
@@ -198,39 +223,43 @@ func (im *Importer) processImage(path string) (int, error) {
 		cropRect := image.Rect(x, y, x2, y2)
 		crop := img.Region(cropRect)
 
-		// 多 cascade 投票：alt/alt2 cascade 也检测一下，至少 2/3 通过才保留
-		votes := 1 // 主 cascade 已投 1 票
-		if im.cascadeAlt != nil {
-			altRects := im.cascadeAlt.DetectMultiScaleWithParams(crop, 1.1, 4, 0, image.Pt(20, 20), image.Pt(0, 0))
-			if len(altRects) > 0 {
-				votes++
+		// 以下三处启发式过滤只为弥补 Haar 的高误检率；
+		// YuNet 是 DNN 检测器且输出关键点，误检率极低，跳过这些检查（保留 embedding norm 过滤）。
+		if im.yunet == nil {
+			// 多 cascade 投票：alt/alt2 cascade 也检测一下，至少 2/3 通过才保留
+			votes := 1 // 主 cascade 已投 1 票
+			if im.cascadeAlt != nil {
+				altRects := im.cascadeAlt.DetectMultiScaleWithParams(crop, 1.1, 4, 0, image.Pt(20, 20), image.Pt(0, 0))
+				if len(altRects) > 0 {
+					votes++
+				}
 			}
-		}
-		if im.cascadeAlt2 != nil {
-			alt2Rects := im.cascadeAlt2.DetectMultiScaleWithParams(crop, 1.1, 4, 0, image.Pt(20, 20), image.Pt(0, 0))
-			if len(alt2Rects) > 0 {
-				votes++
+			if im.cascadeAlt2 != nil {
+				alt2Rects := im.cascadeAlt2.DetectMultiScaleWithParams(crop, 1.1, 4, 0, image.Pt(20, 20), image.Pt(0, 0))
+				if len(alt2Rects) > 0 {
+					votes++
+				}
 			}
-		}
-		if votes < 2 {
-			im.filtered++
-			crop.Close()
-			continue
-		}
+			if votes < 2 {
+				im.filtered++
+				crop.Close()
+				continue
+			}
 
-		// 肤色检测：人脸包含一定比例的肤色像素，非人脸（纯白/纯黑/纹理）没有
-		if !hasSkinTone(crop) {
-			im.filtered++
-			crop.Close()
-			continue
-		}
+			// 肤色检测：人脸包含一定比例的肤色像素，非人脸（纯白/纯黑/纹理）没有
+			if !hasSkinTone(crop) {
+				im.filtered++
+				crop.Close()
+				continue
+			}
 
-		// 面部特征几何验证：水平成对的眼睛，或眼睛+嘴巴的正确位置关系。
-		// 领带/花朵/布料的纹理误检无法通过几何约束。
-		if !im.hasFacialFeatures(crop) {
-			im.filtered++
-			crop.Close()
-			continue
+			// 面部特征几何验证：水平成对的眼睛，或眼睛+嘴巴的正确位置关系。
+			// 领带/花朵/布料的纹理误检无法通过几何约束。
+			if !im.hasFacialFeatures(crop) {
+				im.filtered++
+				crop.Close()
+				continue
+			}
 		}
 
 		embedding, err := im.extractEmbedding(crop)
@@ -285,7 +314,6 @@ func (im *Importer) processImage(path string) (int, error) {
 		saved++
 	}
 
-	detectImg.Close()
 	return saved, nil
 }
 

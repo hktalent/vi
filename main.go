@@ -205,7 +205,17 @@ func runReset(args []string) int {
 		log.Printf("[reset] ✅ images/ 已删除")
 	}
 
-	// 3. 清空 Qdrant 集合
+	// 3. 清空标签与告警文件
+	for _, f := range []string{"labels.json", "alerts.jsonl"} {
+		p := filepath.Join(*dataDir, f)
+		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+			log.Printf("[reset] 删除 %s 失败: %v", f, err)
+		} else {
+			log.Printf("[reset] ✅ %s 已删除", f)
+		}
+	}
+
+	// 4. 清空 Qdrant 集合
 	for _, col := range []string{*faceCol, *plateCol} {
 		url := fmt.Sprintf("%s/collections/%s", *qdURL, col)
 		req, _ := http.NewRequest("DELETE", url, nil)

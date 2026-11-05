@@ -30,6 +30,7 @@ func runImportFaces(args []string) int {
 	force := fs.Bool("force", false, "强制重新导入（忽略已有记录，全部重新处理）")
 	cascade := fs.String("cascade", "", "Haar cascade XML 路径（默认自动搜索 OpenCV 安装路径）")
 	arc := fs.String("arc", "", "arc.onnx 路径（默认 ./models/arc.onnx）")
+	yunet := fs.String("yunet", "", "YuNet 检测模型路径（默认 ./models/face_detection_yunet_2023mar.onnx，缺失回退 Haar）")
 	qdURL := fs.String("qdrant", env("VI_QDRANT", "http://127.0.0.1:6333"), "Qdrant 地址")
 	faceCol := fs.String("face-collection", env("VI_FACE_COLLECTION", "vi_faces"), "人脸集合名")
 	dataDir := fs.String("data", env("VI_DATA", "data"), "数据目录（保存抠图）")
@@ -46,12 +47,21 @@ func runImportFaces(args []string) int {
 
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 
-	// 解析级联分类器路径
+	// 解析 YuNet 检测模型路径（可选，存在则优先于 Haar cascade）
+	yunetPath := *yunet
+	if yunetPath == "" {
+		p := filepath.Join(*modelsDir, "face_detection_yunet_2023mar.onnx")
+		if _, err := os.Stat(p); err == nil {
+			yunetPath = p
+		}
+	}
+
+	// 解析级联分类器路径（YuNet 可用时仅作回退，缺失不致命）
 	cascadePath := *cascade
 	if cascadePath == "" {
 		cascadePath = findHaarCascade()
 	}
-	if _, err := os.Stat(cascadePath); err != nil {
+	if _, err := os.Stat(cascadePath); err != nil && yunetPath == "" {
 		log.Fatalf("Haar cascade 文件不存在: %s", cascadePath)
 	}
 
@@ -88,7 +98,7 @@ func runImportFaces(args []string) int {
 		}
 	}
 
-	imp, err := importface.NewImporter(cfg, qd, st, cascadePath, arcPath, *label, *dryRun, *force)
+	imp, err := importface.NewImporter(cfg, qd, st, cascadePath, arcPath, yunetPath, *label, *dryRun, *force)
 	if err != nil {
 		log.Fatalf("初始化 Importer 失败: %v", err)
 	}
