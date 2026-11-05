@@ -463,7 +463,14 @@ async function refreshCameras() {
   sel.innerHTML = list.map((d, i) =>
     `<option value="${esc(d.deviceId)}">${esc(d.label || ('摄像头 ' + (i + 1)))}</option>`
   ).join('');
-  const pick = saved && list.some(d => d.deviceId === saved) ? saved : list[0].deviceId;
+  let pick = '';
+  if (saved && list.some(d => d.deviceId === saved)) {
+    pick = saved;
+  } else {
+    // 默认选后置摄像头：label 包含 后/rear/environment/back 的优先
+    const rear = list.find(d => /后|rear|environment|back/i.test(d.label || ''));
+    pick = rear ? rear.deviceId : list[list.length - 1].deviceId; // 兜底取最后一个（iOS 后置通常在末尾）
+  }
   sel.value = pick;
 }
 document.getElementById('btnRefreshCam').addEventListener('click', () => {
