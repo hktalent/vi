@@ -46,10 +46,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # CGO 交叉编译不可行，每个平台用原生 runner 构建（含 importfaces，需 OpenCV）
-          - { goos: linux,   goarch: amd64, os: linux,   arch: amd64, runner: ubuntu-latest }
+          # CGO 无法交叉编译（cgo 需要目标平台的 OpenCV），每个平台用原生 runner 构建。
+          # - Linux 用发行版 libopencv-dev：Ubuntu 24.04 自带 OpenCV 4.6，
+          #   vendored gocv 已裁剪掉 4.7+ 才有的 aruco 与 dnn WithParams 绑定，因此 4.6 可编译。
+          # - macOS 的 Homebrew opencv 已升级到 5.0（只提供 opencv5.pc，gocv v0.38 不支持 OpenCV 5），
+          #   改用 keg-only 的 opencv@4（4.x，仍生成 opencv4.pc），并用 PKG_CONFIG_PATH 指向它。
+          # - macOS Intel（darwin/amd64）不再构建：macos-13 runner 已下线，
+          #   且 opencv@4 不再提供 macOS x86_64 bottle，CI 上无法可靠构建。
+          - { goos: linux,   goarch: amd64, os: linux,   arch: amd64, runner: ubuntu-24.04 }
           - { goos: linux,   goarch: arm64, os: linux,   arch: arm64, runner: ubuntu-24.04-arm }
-          - { goos: darwin,  goarch: amd64, os: darwin,  arch: amd64, runner: macos-13 }
           - { goos: darwin,  goarch: arm64, os: darwin,  arch: arm64, runner: macos-latest }
           - { goos: windows, goarch: amd64, os: windows, arch: amd64, runner: windows-latest }
     runs-on: ${{ matrix.runner }}
@@ -64,15 +69,39 @@ jobs:
           check-latest: true
           cache-dependency-path: go.sum
 
+      # 守卫：go.mod 里绝不允许出现本机绝对路径的 replace（曾因 /tmp/gocv_patched 导致构建失败）
+      # 放在最前面，避免 Windows 花 20 分钟编译完 OpenCV 后才失败
+      - name: Guard go.mod against local replaces
+        shell: bash
+        run: |
+          if grep -qE '^[[:space:]]*replace[[:space:]]+.*=>[[:space:]]*/' go.mod; then
+            echo "::error::go.mod 中含有绝对路径 replace，请先恢复为相对路径并提交干净的 go.mod"
+            grep -nE '^[[:space:]]*replace' go.mod
+            exit 1
+          fi
+
       - name: Install OpenCV (Linux)
         if: matrix.os == 'linux'
+        shell: bash
         run: |
           sudo apt-get update
           sudo apt-get install -y libopencv-dev pkg-config
+          pkg-config --modversion opencv4
 
-      - name: Install OpenCV (macOS)
+      # Homebrew 的 opencv 现在是 5.x：只安装 opencv5.pc，gocv v0.38 也不兼容 OpenCV 5。
+      # opencv@4 是 keg-only 公式（不会 link 到 /opt/homebrew），必须显式指定 PKG_CONFIG_PATH。
+      - name: Install OpenCV 4 (macOS)
         if: matrix.os == 'darwin'
-        run: brew install opencv pkg-config
+        shell: bash
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
+        run: |
+          brew install opencv@4 pkg-config
+          PREFIX="$(brew --prefix opencv@4)"
+          echo "PKG_CONFIG_PATH=${PREFIX}/lib/pkgconfig" >> "$GITHUB_ENV"
+          export PKG_CONFIG_PATH="${PREFIX}/lib/pkgconfig"
+          pkg-config --modversion opencv4
 
       - name: Cache OpenCV (Windows)
         if: matrix.os == 'windows'
@@ -103,33 +132,29 @@ jobs:
           tar -xf C:\opencv\contrib.zip -C C:\opencv
           del C:\opencv\opencv.zip C:\opencv\contrib.zip
           echo ==^> Configure
-          cmake C:\opencv\opencv-4.10.0 -G "MinGW Makefiles" -BC:\opencv\build -DENABLE_CXX11=ON -DOPENCV_EXTRA_MODULES_PATH=C:\opencv\opencv_contrib-4.10.0\modules -DCMAKE_BUILD_TYPE=RELEASE -DBUILD_SHARED_LIBS=ON -DWITH_IPP=OFF -DWITH_MSMF=OFF -DBUILD_EXAMPLES=OFF -DBUILD_TESTS=OFF -DBUILD_PERF_TESTS=OFF -DBUILD_opencv_java=OFF -DBUILD_opencv_python=OFF -DBUILD_opencv_python2=OFF -DBUILD_opencv_python3=OFF -DBUILD_DOCS=OFF -DENABLE_PRECOMPILED_HEADERS=OFF -DBUILD_opencv_saliency=OFF -DBUILD_LIST=core,imgproc,imgcodecs,videoio,video,highgui,calib3d,features2d,flann,photo,dnn,objdetect,xfeatures2d,aruco,wechat_qrcode,bgsegm,tracking,plot,img_hash,ximgproc,face -DCPU_DISPATCH= -DWITH_OPENCL_D3D11_NV=OFF -Wno-dev
+          cmake C:\opencv\opencv-4.10.0 -G "MinGW Makefiles" -BC:\opencv\build -DENABLE_CXX11=ON -DOPENCV_EXTRA_MODULES_PATH=C:\opencv\opencv_contrib-4.10.0\modules -DCMAKE_BUILD_TYPE=RELEASE -DBUILD_SHARED_LIBS=ON -DWITH_IPP=OFF -DWITH_MSMF=OFF -DBUILD_EXAMPLES=OFF -DBUILD_TESTS=OFF -DBUILD_PERF_TESTS=OFF -DBUILD_opencv_java=OFF -DBUILD_opencv_python=OFF -DBUILD_opencv_python2=OFF -DBUILD_opencv_python3=OFF -DBUILD_DOCS=OFF -DENABLE_PRECOMPILED_HEADERS=OFF -DBUILD_opencv_saliency=OFF -DWITH_OPENCL_D3D11_NV=OFF -DCPU_DISPATCH= -DBUILD_LIST=core,imgproc,imgcodecs,videoio,video,highgui,calib3d,features2d,flann,photo,dnn,objdetect,xfeatures2d,aruco,wechat_qrcode,bgsegm,tracking,plot,img_hash,ximgproc,face -Wno-dev
           echo ==^> Build (this takes a while)
           cmake --build C:\opencv\build --parallel %NUMBER_OF_PROCESSORS%
           cmake --build C:\opencv\build --target install
           rmdir C:\opencv\opencv-4.10.0 /s /q
           rmdir C:\opencv\opencv_contrib-4.10.0 /s /q
 
-      # 守卫：go.mod 里绝不允许出现本机绝对路径的 replace（曾因 /tmp/gocv_patched 导致构建失败）
-      - name: Guard go.mod against local replaces
-        shell: bash
-        run: |
-          if grep -qE '^[[:space:]]*replace[[:space:]]+.*=>[[:space:]]*/' go.mod; then
-            echo "::error::go.mod 中含有绝对路径 replace，请先恢复为相对路径并提交干净的 go.mod"
-            grep -nE '^[[:space:]]*replace' go.mod
-            exit 1
-          fi
-
-      # vendor/ 已提交且内含 stub 化 gocv（videoio.cpp），go build 默认 -mod=vendor 直接使用，
-      # 无需也不能再跑 patch-gocv.sh（会改 go.mod 导致 inconsistent vendoring）
+      # vendor/ 已提交且内含 stub 化 gocv（videoio.cpp + 裁剪后的 aruco/dnn），
+      # go build 默认 -mod=vendor 直接使用；不能跑 patch-gocv.sh（会改 go.mod 导致 inconsistent vendoring）。
       - name: Build vi
+        shell: bash
         env:
           CGO_ENABLED: "1"
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
         run: |
+          set -euo pipefail
           mkdir -p dist/bin
-          go build -tags importface -trimpath -ldflags "-s -w -X main.Version=${{ github.ref_name }}" -o dist/bin/vi${{ matrix.os == 'windows' && '.exe' || '' }} .
+          ext=""
+          if [ "${{ matrix.os }}" = "windows" ]; then ext=".exe"; fi
+          go build -tags importface -trimpath \
+            -ldflags "-s -w -X main.Version=${{ github.ref_name }}" \
+            -o "dist/bin/vi${ext}" .
 
       - name: Bundle OpenCV DLLs (Windows)
         if: matrix.os == 'windows'
@@ -137,8 +162,6 @@ jobs:
         run: cp /c/opencv/build/install/x64/mingw/bin/*.dll dist/bin/
 
       - name: Download qdrant
-        env:
-          QDRANT_VERSION: ${{ env.QDRANT_VERSION }}
         shell: bash
         run: |
           set -euo pipefail
@@ -176,8 +199,13 @@ jobs:
           PKG="vi-${{ github.ref_name }}-${{ matrix.os }}-${{ matrix.arch }}"
           echo "PKG=$PKG" >> "$GITHUB_ENV"
           mkdir -p "dist/$PKG"
-          cp -r web statics config.example.yaml README.md dist/bin "dist/$PKG/"
-          cp -r scripts "dist/$PKG/" 2>/dev/null || true
+          # 只复制仓库里真实存在的条目：config.example.yaml / statics 目前不在仓库中，
+          # 直接 cp 会让整步失败（之前 Windows / Linux 打包就是死在这里）
+          for p in web statics config.example.yaml README.md scripts dist/bin; do
+            if [ -e "$p" ]; then
+              cp -r "$p" "dist/$PKG/"
+            fi
+          done
           mkdir -p "dist/$PKG/models/haarcascades"
           base="https://raw.githubusercontent.com/opencv/opencv/4.10.0/data/haarcascades"
           for f in haarcascade_frontalface_default.xml haarcascade_frontalface_alt.xml haarcascade_frontalface_alt2.xml haarcascade_eye.xml haarcascade_smile.xml; do
@@ -199,10 +227,23 @@ jobs:
           set -euo pipefail
           cd dist
           case "${{ matrix.os }}" in
-            windows) zip -qr "${PKG}.zip" "$PKG" ;;
+            windows)
+              # Git Bash 不保证带 zip，失败时用 PowerShell 兜底
+              if command -v zip >/dev/null 2>&1; then
+                zip -qr "${PKG}.zip" "$PKG"
+              else
+                pwsh -NoProfile -Command "Compress-Archive -Path './${PKG}' -DestinationPath './${PKG}.zip' -Force"
+              fi
+              ;;
             *) tar -czf "${PKG}.tar.gz" "$PKG" ;;
           esac
-          shasum -a 256 "${PKG}".* > "${PKG}.sha256"
+          if command -v shasum >/dev/null 2>&1; then
+            shasum -a 256 "${PKG}".* > "${PKG}.sha256"
+          elif command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${PKG}".* > "${PKG}.sha256"
+          else
+            for f in "${PKG}".*; do openssl dgst -sha256 "$f"; done > "${PKG}.sha256"
+          fi
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
