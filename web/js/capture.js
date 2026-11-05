@@ -440,7 +440,10 @@ document.getElementById('btnBeep').addEventListener('click', () => beeper.beep(2
 
 // 摄像头设备列表：授权前只能拿到占位名，授权后刷新才能显示真实名称
 const CAM_KEY = 'vi_camera_id';
-async function refreshCameras() {
+// refreshCameras: 枚举摄像头设备
+// forceAuth = true: 在 iOS Safari 上如果还没授权，先静默请求一次 getUserMedia 拿权限
+//                  （必须在用户手势内调用，比如按钮 click）
+async function refreshCameras(forceAuth = false) {
   const sel = document.getElementById('selCamera');
   if (!sel) return;
   if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) {
@@ -454,12 +457,31 @@ async function refreshCameras() {
     sel.innerHTML = '<option value="">枚举失败：' + esc(e.message) + '</option>';
     return;
   }
-  let saved = '';
-  try { saved = localStorage.getItem(CAM_KEY) || ''; } catch (e) {}
+  // iOS Safari 特殊处理：没有活跃 getUserMedia 流时，enumerateDevices 返回空 label 甚至空列表
+  // 只有在用户手势内（forceAuth=true）才可以静默请求权限
+  const needsAuth = !list.length || !list.some(d => d.label && d.label.trim());
+  if (forceAuth && needsAuth) {
+    try {
+      const tmp = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: { ideal: 'environment' } }, audio: false
+      });
+      list = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'videoinput');
+      tmp.getTracks().forEach(t => t.stop());  // 立刻释放临时流
+    } catch (e) {
+      const msg = e.name === 'NotAllowedError'
+        ? '⚠️ 未授权摄像头，请点击"启动摄像头"允许'
+        : e.name === 'NotFoundError' ? '未检测到摄像头'
+        : '⚠️ 设备枚举受限：' + esc(e.message.slice(0, 40));
+      sel.innerHTML = '<option value="">' + msg + '</option>';
+      return;
+    }
+  }
   if (!list.length) {
-    sel.innerHTML = '<option value="">未检测到摄像头（请先允许摄像头权限）</option>';
+    sel.innerHTML = '<option value="">未检测到摄像头</option>';
     return;
   }
+  let saved = '';
+  try { saved = localStorage.getItem(CAM_KEY) || ''; } catch (e) {}
   sel.innerHTML = list.map((d, i) =>
     `<option value="${esc(d.deviceId)}">${esc(d.label || ('摄像头 ' + (i + 1)))}</option>`
   ).join('');
@@ -467,14 +489,15 @@ async function refreshCameras() {
   if (saved && list.some(d => d.deviceId === saved)) {
     pick = saved;
   } else {
-    // 默认选后置摄像头：label 包含 后/rear/environment/back 的优先
     const rear = list.find(d => /后|rear|environment|back/i.test(d.label || ''));
-    pick = rear ? rear.deviceId : list[list.length - 1].deviceId; // 兜底取最后一个（iOS 后置通常在末尾）
+    pick = rear ? rear.deviceId : list[list.length - 1].deviceId;
   }
   sel.value = pick;
 }
-document.getElementById('btnRefreshCam').addEventListener('click', () => {
-  refreshCameras();
+
+// 刷新按钮（用户手势内 → forceAuth=true，能拿到真实设备名）
+document.getElementById('btnRefreshCam').addEventListener('click', async () => {
+  await refreshCameras(true);
   toast('已刷新设备列表', '', 1600);
 });
 document.getElementById('selCamera').addEventListener('change', async e => {
