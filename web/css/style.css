@@ -90,10 +90,13 @@ a:hover { text-decoration: underline; }
 .grid { display: grid; gap: 10px; }
 .main-grid { grid-template-columns: 1fr 1fr; align-items: start; }
 
-/* status-row: chips + 收起按钮强制同一行 */
-.status-row { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; flex-shrink: 0; }
+/* status-row: chips 占位就行，按钮 absolute 到 panel 右上角 */
+.status-row { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; flex-shrink: 0; padding-right: 32px; }
 .status-row .chips { flex: 1 1 auto; min-width: 0; }
-.status-row .collapse-btn { flex-shrink: 0; cursor: pointer; }
+.status-panel .collapse-btn {
+  position: absolute; top: 8px; right: 10px; z-index: 2;
+  flex-shrink: 0; cursor: pointer;
+}
 
 h2 { font-size: 14px; margin: 0 0 8px; color: var(--text); }
 
