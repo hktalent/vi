@@ -36,7 +36,18 @@ function setLive(msg) {
   if (el) el.textContent = msg;
 }
 
-async function addFeed(res, kind) {
+// 本地 blob URL 集合，组件卸载/reload 时统一 revoke 防内存泄漏
+const _blobUrls = new Set();
+function _blobUrl(blob) {
+  const u = URL.createObjectURL(blob);
+  _blobUrls.add(u);
+  return u;
+}
+window.addEventListener('beforeunload', () => { _blobUrls.forEach(u => URL.revokeObjectURL(u)); _blobUrls.clear(); });
+
+// addFeed: 首页实时采集场景，优先用传入的本地 blob URL（零延迟零网络），
+// 没有 blob 时（历史回放/标签页刷新）才走后端 mediaUrl 鉴权
+async function addFeed(res, kind, localBlobUrl) {
   const feed = document.getElementById('feed');
   if (feed.querySelector('.note')) feed.innerHTML = '';
   const e = res.event;
@@ -46,11 +57,16 @@ async function addFeed(res, kind) {
   const attrs = kind === 'face' ? attrText({
     gender: e.gender, age_range: e.age_range, glasses: e.glasses
   }) : '';
-  const signedUrl = await Auth.mediaUrl(e.image);
+  // 优先：本地 blob URL（首页实时采集 → 浏览器内存 → 零延迟零鉴权）
+  let imgUrl = localBlobUrl || '';
+  if (!imgUrl && e.image) {
+    // 备选：后端鉴权 URL（历史数据 / 标签页刷新后）
+    imgUrl = await Auth.mediaUrl(e.image);
+  }
   const div = document.createElement('div');
   div.className = 'feed-item';
-  const imgHtml = signedUrl
-    ? `<img src="${signedUrl}" alt="" />`
+  const imgHtml = imgUrl
+    ? `<img src="${imgUrl}" alt="" />`
     : `<div class="img-placeholder" title="登录后可查看图片">🔒</div>`;
   div.innerHTML = `
     ${imgHtml}
@@ -62,14 +78,14 @@ async function addFeed(res, kind) {
       <div class="meta">${esc(fmtCoord(e.lat, e.lon))}</div>
     </div>`;
   feed.prepend(div);
-  while (feed.children.length > 30) feed.lastChild.remove();
+  while (feed.children.length > 30) { feed.lastChild.remove(); }
 }
 
-async function handleResult(res, kind) {
+async function handleResult(res, kind, localBlobUrl) {
   if (!res || res.skipped) return;
   state.counters.seen++;
   if (kind === 'face') state.counters.faces++; else state.counters.plates++;
-  addFeed(res, kind);
+  addFeed(res, kind, localBlobUrl);
   if (res.alert) {
     state.counters.alerts++;
     beeper.beep(2);
@@ -91,6 +107,8 @@ function formData(kind, capturedAt) {
 }
 
 async function uploadFace(canvas, embedding, attrs) {
+  const blob = await blobOf(canvas);                 // ← 一个 canvas → 一个 blob → 一次编码
+  const localUrl = _blobUrl(blob);                   // ← 本地 blob URL（零延迟零鉴权）
   const fd = formData('face', nowStamp());
   fd.append('vector', JSON.stringify(embedding));
   if (attrs) {
@@ -98,22 +116,24 @@ async function uploadFace(canvas, embedding, attrs) {
     if (attrs.age_range) fd.append('age_range', attrs.age_range);
     if (attrs.glasses) fd.append('glasses', attrs.glasses);
   }
-  fd.append('image', await blobOf(canvas), 'face.jpg');
+  fd.append('image', blob, 'face.jpg');              // ← 同一个 blob 传给 FormData
   const r = await fetch('/api/capture', { method: 'POST', body: fd, headers: Auth._headers() });
   const j = await r.json();
   if (!r.ok) throw new Error(j.error || '上传失败');
-  await handleResult(j, 'face');
+  await handleResult(j, 'face', localUrl);           // ← 本地 URL 传给 addFeed
 }
 
 async function uploadPlate(canvas, text, conf) {
+  const blob = await blobOf(canvas);
+  const localUrl = _blobUrl(blob);
   const fd = formData('plate', nowStamp());
   fd.append('plate_text', text);
   fd.append('plate_conf', String(conf));
-  fd.append('image', await blobOf(canvas), 'plate.jpg');
+  fd.append('image', blob, 'plate.jpg');
   const r = await fetch('/api/capture', { method: 'POST', body: fd, headers: Auth._headers() });
   const j = await r.json();
   if (!r.ok) throw new Error(j.error || '上传失败');
-  await handleResult(j, 'plate');
+  await handleResult(j, 'plate', localUrl);
 }
 
 function blobOf(canvas) {
