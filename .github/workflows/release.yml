@@ -22,35 +22,25 @@ jobs:
           - os: linux
             arch: amd64
             ext: ""
-            qdrant_asset: "qdrant-1.12.4-linux-x86_64.tar.gz"
-            qdrant_bin:   "qdrant-1.12.4-linux-x86_64/qdrant"
+            qdrant_asset: "qdrant-x86_64-unknown-linux-gnu.tar.gz"
           - os: linux
             arch: arm64
             ext: ""
-            qdrant_asset: "qdrant-1.12.4-linux-aarch64.tar.gz"
-            qdrant_bin:   "qdrant-1.12.4-linux-aarch64/qdrant"
+            qdrant_asset: "qdrant-aarch64-unknown-linux-musl.tar.gz"
           # ── macOS ──
           - os: darwin
             arch: amd64
             ext: ""
-            qdrant_asset: "qdrant-1.12.4-macos-x86_64.tar.gz"
-            qdrant_bin:   "qdrant-1.12.4-macos-x86_64/qdrant"
+            qdrant_asset: "qdrant-x86_64-apple-darwin.tar.gz"
           - os: darwin
             arch: arm64
             ext: ""
-            qdrant_asset: "qdrant-1.12.4-macos-aarch64.tar.gz"
-            qdrant_bin:   "qdrant-1.12.4-macos-aarch64/qdrant"
-          # ── Windows ──
+            qdrant_asset: "qdrant-aarch64-apple-darwin.tar.gz"
+          # ── Windows（Qdrant 目前只出 x86_64，没有 arm64）──
           - os: windows
             arch: amd64
             ext: ".exe"
-            qdrant_asset: "qdrant-1.12.4-windows-x86_64.zip"
-            qdrant_bin:   "qdrant-1.12.4-windows-x86_64/qdrant.exe"
-          - os: windows
-            arch: arm64
-            ext: ".exe"
-            qdrant_asset: "qdrant-1.12.4-windows-aarch64.zip"
-            qdrant_bin:   "qdrant-1.12.4-windows-aarch64/qdrant.exe"
+            qdrant_asset: "qdrant-x86_64-pc-windows-msvc.zip"
 
     steps:
       - name: Checkout
