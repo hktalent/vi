@@ -26,26 +26,29 @@
           <canvas id="overlay" class="overlay"></canvas>
           <div class="empty" id="emptyTip">点击「启动摄像头」开始采集<br /><span class="muted">需要浏览器摄像头权限，建议在 127.0.0.1 或 HTTPS 下访问</span></div>
         </div>
-        <div class="toolbar">
-          <span class="status-inline"><span id="liveMsg">未启动</span> <span class="chip" id="chipCamera"><span class="dot"></span>摄像头未启动</span></span>
-          <label class="cam-pick">
-            <span class="muted">视频设备</span>
-            <select class="select" id="selCamera" title="选择摄像头">
-              <option value="">默认摄像头</option>
-            </select>
-          </label>
-          <button class="btn" id="btnRefreshCam" title="重新枚举摄像头">刷新</button>
-          <button class="btn primary" id="btnStart">启动</button>
-          <button class="btn" id="btnStop" disabled>停止</button>
-          <button class="btn" id="btnBeep">鸣叫</button>
-        </div>
+      </section>
 
       <section class="panel status-panel" id="statusPanel">
-        <button class="btn small collapse-btn" id="btnCollapseStatus" title="收起状态栏">收起 ⟩</button>
-        <button class="status-mini" id="statusMini" title="展开状态栏">运行状态</button>
+        <div class="status-row">
+          <div class="toolbar">
+            <span class="chip" id="chipCamera"><span class="dot"></span>摄像头未启动</span>
+            <span class="muted" id="liveMsg" style="font-size:11px;">未启动</span>
+            <label class="cam-pick">
+              <span class="muted">视频设备</span>
+              <select class="select" id="selCamera" title="选择摄像头">
+                <option value="">默认摄像头</option>
+              </select>
+            </label>
+            <button class="btn" id="btnRefreshCam" title="重新枚举摄像头">刷新</button>
+            <button class="btn primary" id="btnStart">启动</button>
+            <button class="btn" id="btnStop" disabled>停止</button>
+            <button class="btn" id="btnBeep">鸣叫</button>
+          </div>
+          <button class="btn small collapse-btn" id="btnCollapseStatus" title="收起状态栏">运行状态 ⟩</button>
+          <button class="status-mini" id="statusMini" title="展开状态栏">运行状态</button>
+        </div>
         <div class="status-body">
-        <h2>运行状态</h2>
-        <div class="chips" style="margin-bottom: 14px;">
+        <div class="chips" style="margin-bottom: 10px;">
           <span class="chip" id="chipQdrant"><span class="dot"></span>Qdrant</span>
           <span class="chip" id="chipFace"><span class="dot"></span>人脸模型</span>
           <span class="chip" id="chipPlate"><span class="dot"></span>车牌模型</span>
@@ -53,13 +56,13 @@
         </div>
         <h2>定位</h2>
         <div class="note" id="geoText">尚未获取定位；未定位时仍会采集，但地址与经纬度为空。</div>
-        <h2 style="margin-top: 18px;">链路</h2>
+        <h2 style="margin-top: 14px;">链路</h2>
         <div class="note">
           人脸：MediaPipe FaceLandmarker 检测/关键点（CPU，每 2 帧）→ 相似变换对齐 112×112 → ArcFace 512 维特征 + FairFace 性别/年龄段 + 眼镜分类（推理在 Worker 后台执行，不卡画面）。<br />
           车牌：YOLO 检测（每 5 帧，静止画面跳过）→ 五点矫正裁剪 → CRNN CTC 字符识别。<br />
           去重：同一身份 60 秒内只入库一次（服务端冷却）+ 前端按目标 6s 防抖。
         </div>
-        <h2 style="margin-top: 18px;">阈值</h2>
+        <h2 style="margin-top: 14px;">阈值</h2>
         <div class="note" id="thresholdText">—</div>
         </div>
       </section>

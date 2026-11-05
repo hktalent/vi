@@ -91,13 +91,15 @@ a:hover { text-decoration: underline; }
 .panel h2 { flex-shrink: 0; margin: 0 0 6px; }
 
 .grid { display: grid; gap: 10px; }
+.main-grid { grid-template-columns: 1fr 1fr; align-items: start; }
+
+/* status-row: 工具栏 + 收起按钮，一行紧凑排布 */
+.status-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-bottom: 6px; flex-shrink: 0; }
 
 h2 { font-size: 14px; margin: 0 0 8px; color: var(--text); }
 
-/* 监测页：stage + toolbar 占满 panel 剩余空间 */
+/* 监测页 stage: 视频区自适应 */
 .stage {
-  flex: 1 1 auto;
-  min-height: 0;
   position: relative;
   background: #000;
   border: 1px solid var(--line);
@@ -280,8 +282,9 @@ body.status-collapsed .status-mini:hover { color: var(--accent); }
   .topbar { padding: 10px 12px; gap: 10px; }
 }
 
-/* 手机竖屏：视频区竖长一些，优先保证画面与采集区可用面积 */
+/* 手机竖屏：两列各占满宽度，视频区竖长一些 */
 @media (max-width: 600px) {
+  .main-grid { grid-template-columns: 1fr; }
   .wrap { padding: 8px 6px 24px; gap: 6px; }
   .panel { padding: 6px 8px; border-radius: 10px; }
   .stage { aspect-ratio: 3 / 4; max-height: 72vh; }
