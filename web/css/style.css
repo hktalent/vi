@@ -86,15 +86,13 @@ a:hover { text-decoration: underline; }
   background: var(--panel);
   border: 1px solid var(--line);
   border-radius: var(--radius);
-  padding: 12px 14px;
+  padding: 8px 10px;
 }
-.panel h2 { flex-shrink: 0; margin: 0 0 8px; }
+.panel h2 { flex-shrink: 0; margin: 0 0 6px; }
 
-.grid { display: grid; gap: 16px; }
+.grid { display: grid; gap: 10px; }
 
-h1 { font-size: 20px; margin: 20px 0 6px; }
-h2 { font-size: 15px; margin: 0 0 12px; color: var(--text); }
-.sub { color: var(--muted); font-size: 13px; margin-bottom: 16px; }
+h2 { font-size: 14px; margin: 0 0 8px; color: var(--text); }
 
 /* 监测页：stage + toolbar 占满 panel 剩余空间 */
 .stage {
@@ -115,11 +113,14 @@ h2 { font-size: 15px; margin: 0 0 12px; color: var(--text); }
   color: var(--muted); text-align: center; padding: 20px;
 }
 
-.toolbar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-top: 10px; flex-shrink: 0; }
+.toolbar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 6px; flex-shrink: 0; }
 
-.cam-pick { display: flex; align-items: center; gap: 8px; }
-.cam-pick span { font-size: 12px; white-space: nowrap; }
-.cam-pick .select { max-width: 240px; padding: 8px 10px; font-size: 13px; }
+/* 运行状态内联：文字 + chip 一行，和按钮/选择器并列 */
+.status-inline { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); white-space: nowrap; padding: 0 4px; }
+
+.cam-pick { display: flex; align-items: center; gap: 4px; }
+.cam-pick span { font-size: 11px; white-space: nowrap; }
+.cam-pick .select { max-width: 200px; padding: 5px 8px; font-size: 12px; }
 
 @media (max-width: 560px) {
   .cam-pick { width: 100%; }
@@ -134,9 +135,9 @@ h2 { font-size: 15px; margin: 0 0 12px; color: var(--text); }
   border: 1px solid var(--line);
   background: var(--panel-2);
   color: var(--text);
-  padding: 8px 14px;
-  border-radius: 10px;
-  font-size: 13px;
+  padding: 5px 10px;
+  border-radius: 8px;
+  font-size: 12px;
   cursor: pointer;
   transition: .15s;
 }
@@ -149,13 +150,13 @@ h2 { font-size: 15px; margin: 0 0 12px; color: var(--text); }
 
 .chips { display: flex; flex-wrap: wrap; gap: 8px; }
 .chip {
-  display: inline-flex; align-items: center; gap: 6px;
-  padding: 4px 10px;
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 2px 8px;
   border-radius: 999px;
   background: var(--panel-2);
   border: 1px solid var(--line);
   color: var(--muted);
-  font-size: 12px;
+  font-size: 11px;
 }
 .chip .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); }
 .chip.ok .dot { background: var(--accent); }
@@ -281,13 +282,12 @@ body.status-collapsed .status-mini:hover { color: var(--accent); }
 
 /* 手机竖屏：视频区竖长一些，优先保证画面与采集区可用面积 */
 @media (max-width: 600px) {
-  h1 { font-size: 17px; margin-top: 12px; }
-  .sub { display: none; }
-  .panel { padding: 12px; border-radius: 12px; }
-  .stage { aspect-ratio: 3 / 4; max-height: 66vh; }
+  .wrap { padding: 8px 6px 24px; gap: 6px; }
+  .panel { padding: 6px 8px; border-radius: 10px; }
+  .stage { aspect-ratio: 3 / 4; max-height: 72vh; }
   .feed { max-height: none; }
   .toast-wrap { left: 12px; right: 12px; bottom: 12px; }
   .toast { min-width: 0; font-size: 13px; }
-  .stat .num { font-size: 15px; }
-  .stat .lbl { font-size: 10px; }
+  .stat .num { font-size: 14px; }
+  .stat .lbl { font-size: 11px; }
 }

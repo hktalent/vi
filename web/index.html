@@ -19,17 +19,15 @@
   </header>
 
   <main class="wrap">
-    <h1>实时监测</h1>
-    <p class="sub">摄像头画面只在本地浏览器处理：人脸对齐与特征矩阵、车牌检测与字符识别全部由 ONNX Runtime Web 在本机完成，仅上传裁剪后的小图与结果。</p>
-
     <div class="grid main-grid">
-      <section class="panel" style="padding: 12px;">
+      <section class="panel">
         <div class="stage">
           <video id="video" autoplay playsinline muted></video>
           <canvas id="overlay" class="overlay"></canvas>
           <div class="empty" id="emptyTip">点击「启动摄像头」开始采集<br /><span class="muted">需要浏览器摄像头权限，建议在 127.0.0.1 或 HTTPS 下访问</span></div>
         </div>
         <div class="toolbar">
+          <span class="status-inline"><span id="liveMsg">未启动</span> <span class="chip" id="chipCamera"><span class="dot"></span>摄像头未启动</span></span>
           <label class="cam-pick">
             <span class="muted">视频设备</span>
             <select class="select" id="selCamera" title="选择摄像头">
@@ -37,13 +35,10 @@
             </select>
           </label>
           <button class="btn" id="btnRefreshCam" title="重新枚举摄像头">刷新</button>
-          <button class="btn primary" id="btnStart">启动摄像头</button>
+          <button class="btn primary" id="btnStart">启动</button>
           <button class="btn" id="btnStop" disabled>停止</button>
-          <button class="btn" id="btnBeep">鸣叫测试</button>
-          <span class="chip" id="chipCamera"><span class="dot"></span>摄像头未启动</span>
+          <button class="btn" id="btnBeep">鸣叫</button>
         </div>
-        <div class="note" id="liveStat" style="margin-top: 8px;">未启动</div>
-      </section>
 
       <section class="panel status-panel" id="statusPanel">
         <button class="btn small collapse-btn" id="btnCollapseStatus" title="收起状态栏">收起 ⟩</button>

@@ -32,7 +32,7 @@ let lastLive = '';
 function setLive(msg) {
   if (msg === lastLive) return;
   lastLive = msg;
-  const el = document.getElementById('liveStat');
+  const el = document.getElementById('liveMsg');
   if (el) el.textContent = msg;
 }
 
@@ -348,7 +348,7 @@ async function start() {
     setChip('chipCamera', true, '摄像头运行中');
     state.running = true;
     document.getElementById('btnStop').disabled = false;
-    refreshCameras(); // 授权后设备名才可见
+    refreshCamerasDebounced(false); // 授权后设备名才可见（debounce 避免和 video.play 叠）
     await loadEngines();
     state.timers.forEach(clearTimeout);
     state.timers = [];
@@ -440,6 +440,21 @@ const CAM_KEY = 'vi_camera_id';
 // refreshCameras: 枚举摄像头设备
 // forceAuth = true: 在 iOS Safari 上如果还没授权，先静默请求一次 getUserMedia 拿权限
 //                  （必须在用户手势内调用，比如按钮 click）
+// refreshCamerasDebounced：防 iOS Safari 短时间多次触发 enumerateDevices 崩溃
+// visibilitychange + video.play + start() 授权成功可能在 500ms 内连续触发 3 次
+let _rcTimer = null;
+let _rcLastAuth = false;
+function refreshCamerasDebounced(forceAuth = false) {
+  if (_rcTimer) clearTimeout(_rcTimer);
+  _rcLastAuth = _rcLastAuth || forceAuth;  // 期间有一次 forceAuth 就保留
+  _rcTimer = setTimeout(() => {
+    const auth = _rcLastAuth;
+    _rcTimer = null;
+    _rcLastAuth = false;
+    refreshCameras(auth);
+  }, 300);
+}
+
 async function refreshCameras(forceAuth = false) {
   const sel = document.getElementById('selCamera');
   if (!sel) return;
@@ -510,15 +525,15 @@ document.getElementById('selCamera').addEventListener('change', async e => {
 // 3. addEventListener('devicechange', refreshCameras) 会把 Event 对象当 forceAuth 传入！
 //    Event 对象是 truthy → forceAuth=true → 循环触发 getUserMedia → **页面卡死崩溃**！
 //    必须用箭头函数包一层显式传 false
+// 事件回调里全部用 debounced，防 iOS Safari 短时间多次 enumerateDevices 崩溃
 if (navigator.mediaDevices && navigator.mediaDevices.addEventListener) {
-  navigator.mediaDevices.addEventListener('devicechange', () => refreshCameras(false));
+  navigator.mediaDevices.addEventListener('devicechange', () => refreshCamerasDebounced(false));
 }
-// iOS Safari devicechange 不触发 → visibilitychange 兜底（切前后台回来重枚举）
 document.addEventListener('visibilitychange', () => {
-  if (!document.hidden) refreshCameras(false);
+  if (!document.hidden) refreshCamerasDebounced(false);
 });
-// video.play 回调：传 false（只枚举，不触发权限请求）
-video.addEventListener('play', () => setTimeout(() => refreshCameras(false), 500));
+// video.play 里的 setTimeout 也要用 debounced — 和 start() 里的调用可能只隔几百毫秒
+video.addEventListener('play', () => setTimeout(() => refreshCamerasDebounced(false), 500));
 // 初始枚举：forceAuth=false（页面加载时没有用户手势，iOS 不允许触发权限请求）
 refreshCameras();
 
