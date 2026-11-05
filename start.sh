@@ -4,7 +4,7 @@ set -e
 cd "$(dirname "$0")"
 
 if [ ! -x bin/vi ]; then
-  go build -o bin/vi .
+  go build  -trimpath -ldflags "-s -w" -o bin/vi .
 fi
 
 if ! curl -s -m 2 http://127.0.0.1:6333/ > /dev/null 2>&1; then
