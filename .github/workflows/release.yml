@@ -1,0 +1,190 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"          # push v0.1.0 等 tag 触发
+  workflow_dispatch:  # 也可手动触发，输入 tag 名
+
+permissions:
+  contents: write     # 创建 Release + 上传 assets
+
+env:
+  QDRANT_VERSION: "1.12.4"
+
+jobs:
+  # ─── 构建 vi Go 二进制（6 个目标交叉编译）───────────────────────────────────
+  build:
+    name: Build vi (${{ matrix.os }} / ${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ── Linux ──
+          - os: linux
+            arch: amd64
+            ext: ""
+            qdrant_asset: "qdrant-${{ env.QDRANT_VERSION }}-linux-x86_64.tar.gz"
+            qdrant_bin:   "qdrant-${{ env.QDRANT_VERSION }}-linux-x86_64/qdrant"
+          - os: linux
+            arch: arm64
+            ext: ""
+            qdrant_asset: "qdrant-${{ env.QDRANT_VERSION }}-linux-aarch64.tar.gz"
+            qdrant_bin:   "qdrant-${{ env.QDRANT_VERSION }}-linux-aarch64/qdrant"
+          # ── macOS ──
+          - os: darwin
+            arch: amd64
+            ext: ""
+            qdrant_asset: "qdrant-${{ env.QDRANT_VERSION }}-macos-x86_64.tar.gz"
+            qdrant_bin:   "qdrant-${{ env.QDRANT_VERSION }}-macos-x86_64/qdrant"
+          - os: darwin
+            arch: arm64
+            ext: ""
+            qdrant_asset: "qdrant-${{ env.QDRANT_VERSION }}-macos-aarch64.tar.gz"
+            qdrant_bin:   "qdrant-${{ env.QDRANT_VERSION }}-macos-aarch64/qdrant"
+          # ── Windows ──
+          - os: windows
+            arch: amd64
+            ext: ".exe"
+            qdrant_asset: "qdrant-${{ env.QDRANT_VERSION }}-windows-x86_64.zip"
+            qdrant_bin:   "qdrant-${{ env.QDRANT_VERSION }}-windows-x86_64/qdrant.exe"
+          - os: windows
+            arch: arm64
+            ext: ".exe"
+            qdrant_asset: "qdrant-${{ env.QDRANT_VERSION }}-windows-aarch64.zip"
+            qdrant_bin:   "qdrant-${{ env.QDRANT_VERSION }}-windows-aarch64/qdrant.exe"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache: "mod"
+
+      - name: Build vi binary
+        env:
+          GOOS:   ${{ matrix.os }}
+          GOARCH: ${{ matrix.arch }}
+          CGO_ENABLED: "0"
+        run: |
+          mkdir -p dist/bin
+          NAME="vi-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.ext }}"
+          go build \
+            -ldflags "-s -w -X main.Version=${GITHUB_REF_NAME}" \
+            -trimpath \
+            -o "dist/bin/${NAME}" \
+            .
+          ls -lh dist/bin/
+
+      - name: Download bundled Qdrant
+        run: |
+          ASSET="${{ matrix.qdrant_asset }}"
+          QDRANT_URL="https://github.com/qdrant/qdrant/releases/download/v${{ env.QDRANT_VERSION }}/${ASSET}"
+          echo "下载 Qdrant: $QDRANT_URL"
+          mkdir -p dist/bin
+          cd dist/bin
+          curl -fL -o "$ASSET" "$QDRANT_URL"
+          case "$ASSET" in
+            *.tar.gz) tar xzf "$ASSET" ;;
+            *.zip)    unzip -o  "$ASSET" ;;
+          esac
+          # 找到解压后的 qdrant 二进制，重命名为统一名字
+          QD_BIN="$(find . -maxdepth 2 -type f -name 'qdrant*' | head -1)"
+          if [ -z "$QD_BIN" ]; then
+            echo "⚠️  未在 ${ASSET} 中找到 qdrant 二进制，跳过"
+          else
+            chmod +x "$QD_BIN" || true
+            cp "$QD_BIN" "qdrant${{ matrix.ext }}"
+          fi
+          ls -lh
+
+      - name: Assemble release tree
+        run: |
+          PKG="vi-${{ matrix.os }}-${{ matrix.arch }}"
+          mkdir -p "dist/${PKG}/bin" "dist/${PKG}/data/images" "dist/${PKG}/data/reports"
+          cp dist/bin/vi-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.ext }} "dist/${PKG}/bin/vi${{ matrix.ext }}"
+          cp dist/bin/qdrant${{ matrix.ext }} "dist/${PKG}/bin/" || true
+          cp -r web   "dist/${PKG}/"
+          cp -r scripts "dist/${PKG}/" || true
+          cp start.sh  "dist/${PKG}/"
+          cp stop.sh   "dist/${PKG}/"
+          cp README.md "dist/${PKG}/"
+          printf '* text=auto eol=lf\n*.{exe,dll,so,dylib} binary\n' > "dist/${PKG}/.gitattributes"
+          # shell 脚本统一 LF
+          if [ "${{ matrix.os }}" != "windows" ]; then
+            sed -i 's/\r$//' "dist/${PKG}/start.sh" "dist/${PKG}/stop.sh"
+          fi
+          chmod +x "dist/${PKG}/start.sh" "dist/${PKG}/stop.sh" || true
+          echo "── Release tree ──"
+          find "dist/${PKG}" -maxdepth 2 | sort
+
+      - name: Archive
+        run: |
+          PKG="vi-${{ matrix.os }}-${{ matrix.arch }}"
+          TAG="${GITHUB_REF_NAME:-manual}"
+          if [ "${{ matrix.os }}" = "windows" ]; then
+            (cd dist && zip -r "../${PKG}-${TAG}.zip" "${PKG}")
+            echo "artifact=${PKG}-${TAG}.zip" >> "$GITHUB_OUTPUT"
+          else
+            tar czf "${PKG}-${TAG}.tar.gz" -C dist "${PKG}"
+            echo "artifact=${PKG}-${TAG}.tar.gz" >> "$GITHUB_OUTPUT"
+          fi
+          ls -lh
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vi-${{ matrix.os }}-${{ matrix.arch }}
+          path: dist/*.${{ matrix.os }}
+          include-hidden-files: true
+
+  # ─── 模型包（单独一个 asset，~400MB）───────────────────────────────────────────
+  models:
+    name: Package models
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (depth=0 to pull LFS)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          lfs: true
+
+      - name: Tar models
+        run: |
+          TAG="${GITHUB_REF_NAME:-manual}"
+          tar czf "vi-models-${TAG}.tar.gz" models/
+          ls -lh vi-models-${TAG}.tar.gz
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vi-models
+          path: vi-models-*.tar.gz
+
+  # ─── 发布 GitHub Release ─────────────────────────────────────────────────────
+  release:
+    name: Create GitHub Release
+    needs: [build, models]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: assets
+
+      - name: List assets
+        run: find assets -type f -ls
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name:  ${{ github.ref_name }}
+          name:      vi ${{ github.ref_name }}
+          generate_release_notes: true
+          files:     assets/**/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

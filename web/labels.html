@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>vi · 标签</title>
+  <link rel="stylesheet" href="/css/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">vi<small>见到你 · 人脸与车牌记忆</small></div>
+    <nav class="nav">
+      <a href="/">实时监测</a>
+      <a class="active" href="/labels.html">标签</a>
+      <a href="/search.html">检索</a>
+      <a href="/stats.html">统计</a>
+    </nav>
+  </header>
+
+  <main class="wrap">
+    <h1>标签管理</h1>
+    <p class="sub">给已经采集到的人脸 / 车牌起名字。给同一个身份打标签后，之后每次再见到都会命中；勾选“鸣叫”即可在监测页自动发声。</p>
+
+    <section class="panel">
+      <h2>已有标签</h2>
+      <div style="overflow:auto;">
+        <table>
+          <thead>
+            <tr><th>标签</th><th>类型</th><th>身份</th><th>出现次数</th><th>最近出现</th><th>鸣叫</th><th></th></tr>
+          </thead>
+          <tbody id="labelRows"><tr><td colspan="7" class="muted">加载中…</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel" style="margin-top: 16px;">
+      <h2>采集到的身份</h2>
+      <div class="tabs">
+        <button class="btn active" data-kind="face">人脸</button>
+        <button class="btn" data-kind="plate">车牌</button>
+        <input class="input" id="q" placeholder="按标签名 / 车牌筛选" style="margin-left:auto; max-width: 220px;" />
+        <button class="btn" id="btnSearch">筛选</button>
+      </div>
+      <div class="cards" id="cards"><div class="note">加载中…</div></div>
+      <div class="pager">
+        <span id="pageInfo"></span>
+        <button class="btn small" id="prev">上一页</button>
+        <button class="btn small" id="next">下一页</button>
+      </div>
+    </section>
+  </main>
+
+  <script src="/js/common.js"></script>
+  <script src="/js/labels.js"></script>
+</body>
+</html>

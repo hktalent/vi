@@ -1,0 +1,30 @@
+# Go 产物
+/bin/
+*.exe
+*.test
+
+# 运行时数据（全排除）
+/data/
+.qdrant-initialized
+
+# AI 模型（进 GitHub Release，不进 git）
+/models/
+*.onnx
+*.task
+
+# MediaPipe / ORT WASM 也较大，进 Release
+/web/vendor/ort/*.wasm
+/web/vendor/ort/*.asyncify.*.mjs
+/web/vendor/ort/*.jsep.*.mjs
+/web/vendor/ort/*.jspi.*.mjs
+/web/vendor/ort/*.mjs
+/web/vendor/mp/wasm/
+
+# 编辑器
+.DS_Store
+.idea/
+.vscode/
+
+# 证书
+server.key
+server.crt

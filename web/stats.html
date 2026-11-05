@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>vi · 统计</title>
+  <link rel="stylesheet" href="/css/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">vi<small>见到你 · 人脸与车牌记忆</small></div>
+    <nav class="nav">
+      <a href="/">实时监测</a>
+      <a href="/labels.html">标签</a>
+      <a href="/search.html">检索</a>
+      <a class="active" href="/stats.html">统计</a>
+    </nav>
+  </header>
+
+  <main class="wrap">
+    <h1>统计</h1>
+    <p class="sub">统计时段内见过的人与车辆；按天生成 Markdown 总结文档。</p>
+
+    <section class="panel">
+      <div class="form-row">
+        <label class="muted">从</label>
+        <input class="input" type="date" id="from" />
+        <label class="muted">到</label>
+        <input class="input" type="date" id="to" />
+        <button class="btn primary" id="btnQuery">查询</button>
+      </div>
+      <div class="stats-row" style="margin-top: 16px;">
+        <div class="stat"><div class="num" id="sFaces">—</div><div class="lbl">人脸次数</div></div>
+        <div class="stat"><div class="num" id="sPlates">—</div><div class="lbl">车牌次数</div></div>
+        <div class="stat"><div class="num" id="sPersons">—</div><div class="lbl">不同人数</div></div>
+        <div class="stat"><div class="num" id="sUniquePlates">—</div><div class="lbl">不同车辆</div></div>
+      </div>
+      <div class="legend">
+        <span><i style="background:var(--accent)"></i>人脸</span>
+        <span><i style="background:var(--accent-2)"></i>车牌</span>
+        <span class="muted" id="labeledInfo"></span>
+      </div>
+      <div class="bars" id="bars"></div>
+    </section>
+
+    <section class="panel" style="margin-top: 16px;">
+      <h2>定期总结</h2>
+      <div class="form-row">
+        <input class="input" type="date" id="summaryDate" />
+        <button class="btn" id="btnSummary">生成当日 Markdown</button>
+        <span class="muted">每天 23:50 自动生成当天的总结文档（可用 VI_SUMMARY_AT 调整）。</span>
+      </div>
+      <div style="overflow:auto; margin-top: 14px;">
+        <table>
+          <thead><tr><th>文档</th><th>生成时间</th><th>大小</th></tr></thead>
+          <tbody id="reportRows"><tr><td colspan="3" class="muted">加载中…</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <script src="/js/common.js"></script>
+  <script src="/js/stats.js"></script>
+</body>
+</html>

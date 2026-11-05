@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>vi · 检索</title>
+  <link rel="stylesheet" href="/css/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">vi<small>见到你 · 人脸与车牌记忆</small></div>
+    <nav class="nav">
+      <a href="/">实时监测</a>
+      <a href="/labels.html">标签</a>
+      <a class="active" href="/search.html">检索</a>
+      <a href="/stats.html">统计</a>
+    </nav>
+  </header>
+
+  <main class="wrap">
+    <h1>检索</h1>
+    <p class="sub">按日期、车牌、标签或地名查询过去的每一次“遇见”，每页 20 条。</p>
+
+    <section class="panel">
+      <div class="tabs">
+        <button class="btn active" data-mode="date">按日期</button>
+        <button class="btn" data-mode="plate">按车牌</button>
+        <button class="btn" data-mode="label">按标签</button>
+        <button class="btn" data-mode="place">按地名/街道</button>
+      </div>
+      <div class="form-row">
+        <input class="input wide" id="q" placeholder="选择日期" />
+        <button class="btn primary" id="btnSearch">查询</button>
+        <span class="muted" id="hint">例如：2026-11-04</span>
+      </div>
+    </section>
+
+    <section class="panel" style="margin-top: 16px;">
+      <h2 id="resultTitle">结果</h2>
+      <div style="overflow:auto;">
+        <table>
+          <thead>
+            <tr><th>时间</th><th>类型</th><th>对象</th><th>地址</th><th>坐标</th><th>图片</th></tr>
+          </thead>
+          <tbody id="rows"><tr><td colspan="6" class="muted">输入条件后查询。</td></tr></tbody>
+        </table>
+      </div>
+      <div class="pager">
+        <span id="pageInfo"></span>
+        <button class="btn small" id="prev">上一页</button>
+        <button class="btn small" id="next">下一页</button>
+      </div>
+    </section>
+  </main>
+
+  <script src="/js/common.js"></script>
+  <script src="/js/search.js"></script>
+</body>
+</html>
