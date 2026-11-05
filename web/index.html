@@ -24,7 +24,7 @@
         <div class="stage">
           <video id="video" autoplay playsinline muted></video>
           <canvas id="overlay" class="overlay"></canvas>
-          <div class="empty" id="emptyTip">点击「启动摄像头」开始采集<br /><span class="muted">需要浏览器摄像头权限，建议在 127.0.0.1 或 HTTPS 下访问</span></div>
+          <div class="empty" id="emptyTip">点击「启动摄像头」开始采集<br /><span class="muted">需要浏览器摄像头、定位权限，建议在HTTPS 下访问</span></div>
           <div class="stage-hud" id="stageHud">
             <span class="chip" id="chipCamera"><span class="dot"></span>摄像头未启动</span>
             <span class="muted" id="liveMsg"></span>
@@ -52,8 +52,9 @@
             <span class="chip" id="chipPlate"><span class="dot"></span>车牌模型</span>
             <span class="chip" id="chipGeo"><span class="dot"></span>定位</span>
           </div>
-          <button class="btn small collapse-btn" id="btnCollapseStatus" title="收起状态栏">运行状态 ⟩</button>
-          <button class="status-mini" id="statusMini" title="展开状态栏">运行状态</button>
+          <button class="btn small collapse-btn" id="btnCollapseStatus" title="收起状态栏">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg>
+          </button>
         </div>
         <div class="status-body">
         <h2>定位</h2>
@@ -67,17 +68,21 @@
         <h2 style="margin-top: 14px;">阈值</h2>
         <div class="note" id="thresholdText">—</div>
         </div>
+        <!-- status-mini 和 status-row/status-body 同级，收缩时不会被父 display:none 干掉 -->
+        <button class="status-mini" id="statusMini" title="展开状态栏">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M15 3v18"/><path d="m10 9-3 3 3 3"/></svg>
+        </button>
       </section>
     </div>
 
-    <div class="stats-row" style="margin-top: 16px;">
+    <div class="stats-row">
       <div class="stat" title="本次采集人脸"><div class="num" id="numFaces">0</div><div class="lbl">人脸</div></div>
       <div class="stat" title="本次采集车牌"><div class="num" id="numPlates">0</div><div class="lbl">车牌</div></div>
       <div class="stat" title="标签命中鸣叫"><div class="num" id="numAlerts">0</div><div class="lbl">鸣叫</div></div>
       <div class="stat" title="本次识别目标"><div class="num" id="numSeen">0</div><div class="lbl">目标</div></div>
     </div>
 
-    <section class="panel" style="margin-top: 16px;">
+    <section class="panel">
       <h2>最近采集</h2>
       <div class="feed" id="feed"><div class="note">还没有采集记录。</div></div>
     </section>

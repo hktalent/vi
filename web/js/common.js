@@ -99,11 +99,12 @@ const Auth = {
 // 关键：iOS Safari WKWebView per-process 内存上限 ~500MB
 //       Cache API hit.arrayBuffer() 把模型全读进内存 → ORT create 再拷贝到 WASM → 双份内存
 //       arc.onnx(130MB) + FairFace三模型(250MB) × 2 = 760MB → 💥 崩溃
-// 修复：iOS Safari 禁用 Cache API，让它走 HTTP immutable 缓存（按需 fetch，内存开销只在 ORT create 时）
+// 修复：iOS Safari 禁用 Cache API + 串行加载 + 每模型 createSession 后立刻释放原始 ArrayBuffer
 const _MODEL_CACHE = 'vi-models-v1';
 const _cacheDisabled = new Set();   // 记录哪些 URL 的 Cache API 存失败过，后续直接 fetch
-const _disableCacheAPI = /iP(hone|od|ad)/.test(navigator.platform) ||
-  (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);  // iPadOS 也禁用
+const _isIOSSafari = /iP(hone|od|ad)/.test(navigator.platform) ||
+  (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);  // iPadOS 也算
+const _disableCacheAPI = _isIOSSafari;  // iOS/iPadOS 一律禁用 Cache API
 
 async function _modelAB(url) {
   // iOS/iPadOS Safari: 禁用 Cache API — 400MB 模型全进 JS 内存 + WASM 拷贝 → 内存爆
@@ -274,3 +275,4 @@ window.todayStr = todayStr;
 window.geoState = geoState;
 window.setChip = setChip;
 window.fmtCoord = fmtCoord;
+window._isIOSSafari = _isIOSSafari;

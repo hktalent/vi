@@ -27,13 +27,14 @@ function updateCounters() {
   document.getElementById('numSeen').textContent = state.counters.seen;
 }
 
-// 实时诊断行：只在内容变化时写 DOM
+// 实时诊断行：已由 chip 状态条替代，不再单独显示
 let lastLive = '';
 function setLive(msg) {
+  // 保留函数签名但不写 DOM，chipCamera/chipFace 等已经覆盖状态展示
   if (msg === lastLive) return;
   lastLive = msg;
   const el = document.getElementById('liveMsg');
-  if (el) el.textContent = msg;
+  if (el) el.textContent = '';
 }
 
 // 本地 blob URL 集合，组件卸载/reload 时统一 revoke 防内存泄漏
@@ -568,8 +569,14 @@ function setStatusCollapsed(v) {
   document.body.classList.toggle('status-collapsed', v);
   try { localStorage.setItem(STATUS_COLLAPSE_KEY, v ? '1' : '0'); } catch (e) {}
 }
-document.getElementById('btnCollapseStatus').addEventListener('click', () => setStatusCollapsed(true));
-document.getElementById('statusMini').addEventListener('click', () => setStatusCollapsed(false));
+document.getElementById('btnCollapseStatus').addEventListener('click', (e) => { e.stopPropagation(); setStatusCollapsed(true); });
+document.getElementById('statusMini').addEventListener('click', (e) => { e.stopPropagation(); setStatusCollapsed(false); });
+// 收缩后整个 status-panel 都可点击展开（比只点小图标区域大）
+document.getElementById('statusPanel').addEventListener('click', () => {
+  if (document.body.classList.contains('status-collapsed')) {
+    setStatusCollapsed(false);
+  }
+});
 (function initStatusCollapse() {
   let v = null;
   try { v = localStorage.getItem(STATUS_COLLAPSE_KEY); } catch (e) {}

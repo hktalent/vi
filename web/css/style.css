@@ -17,12 +17,11 @@
 html, body {
   margin: 0;
   padding: 0;
-  height: 100%;
   background: var(--bg);
   color: var(--text);
   font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", "Segoe UI", sans-serif;
   font-size: 14px;
-  overflow: hidden; /* 外层绝不出滚动条 */
+  overflow-x: hidden;
 }
 
 /* 让 body 成为 flex 容器：顶栏 → 内容区 */
@@ -57,13 +56,10 @@ a:hover { text-decoration: underline; }
 .nav a.active { color: #08120f; background: var(--accent); font-weight: 600; }
 
 .wrap {
-  flex: 1 1 auto;
-  min-height: 0; /* flex 子项必须有这个才能 overflow */
   max-width: 1240px;
   width: 100%;
   margin: 0 auto;
   padding: 16px 18px 18px;
-  overflow: hidden; /* wrap 本身不出滚动条，内部 panel 各滚各的 */
   display: flex;
   flex-direction: column;
   gap: 8px;
@@ -72,10 +68,8 @@ a:hover { text-decoration: underline; }
 /* 监测页标题区（标题 + 工具条） */
 .wrap > h1, .wrap > .sub, .wrap > .toolbar { flex-shrink: 0; }
 
-/* main-grid 撑满剩余空间 */
+/* main-grid: 跟随内容高度 */
 .grid.main-grid {
-  flex: 1 1 auto;
-  min-height: 0;
   display: grid;
   gap: 14px;
 }
@@ -96,12 +90,14 @@ a:hover { text-decoration: underline; }
 .grid { display: grid; gap: 10px; }
 .main-grid { grid-template-columns: 1fr 1fr; align-items: start; }
 
-/* status-row: 工具栏 + 收起按钮，一行紧凑排布 */
-.status-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-bottom: 6px; flex-shrink: 0; }
+/* status-row: chips + 收起按钮强制同一行 */
+.status-row { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; flex-shrink: 0; }
+.status-row .chips { flex: 1 1 auto; min-width: 0; }
+.status-row .collapse-btn { flex-shrink: 0; cursor: pointer; }
 
 h2 { font-size: 14px; margin: 0 0 8px; color: var(--text); }
 
-/* 监测页 stage: 视频区自适应 */
+/* 监测页 stage: 视频区自适应，桌面端高度封顶防 main-grid 被撑爆 */
 .stage {
   position: relative;
   background: #000;
@@ -109,7 +105,7 @@ h2 { font-size: 14px; margin: 0 0 8px; color: var(--text); }
   border-radius: var(--radius);
   overflow: hidden;
   aspect-ratio: 16 / 9; /* 桌面：视频区自适应 16:9 */
-  max-height: 100%;
+  max-height: min(55vh, 520px);
 }
 .stage video { width: 100%; height: 100%; object-fit: cover; display: block; }
 .stage canvas.overlay { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
@@ -188,7 +184,7 @@ h2 { font-size: 14px; margin: 0 0 8px; color: var(--text); }
 .stat .num { font-size: 14px; font-weight: 700; color: var(--accent); line-height: 1; }
 .stat .lbl { color: var(--muted); font-size: 13px; line-height: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
-.feed { flex: 1 1 auto; min-height: 0; overflow: auto; display: grid; gap: 10px; align-content: start; }
+.feed { display: grid; gap: 10px; align-content: start; }
 .feed-item {
   display: grid; grid-template-columns: 64px 1fr; gap: 12px;
   padding: 10px; border: 1px solid var(--line); border-radius: 12px; background: var(--panel-2);
@@ -270,27 +266,26 @@ tr:hover td { background: rgba(90, 169, 255, .04); }
 .main-grid { grid-template-columns: minmax(0, 1.55fr) minmax(300px, .8fr); min-height: 0; }
 .status-panel { position: relative; display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
 .status-panel h2 { flex-shrink: 0; }
-.collapse-btn { position: absolute; top: 12px; right: 12px; z-index: 2; color: var(--muted); }
 .status-body { flex: 1 1 auto; min-height: 0; overflow: auto; display: flex; flex-direction: column; gap: 10px; padding-right: 4px; }
 .status-mini { display: none; }
 body.status-collapsed .main-grid { grid-template-columns: minmax(0, 1fr) 46px; }
-body.status-collapsed .status-panel { padding: 0; overflow: hidden; }
+body.status-collapsed .status-panel { padding: 0; cursor: pointer; }
+body.status-collapsed .status-row,
 body.status-collapsed .status-body,
 body.status-collapsed .collapse-btn { display: none; }
 body.status-collapsed .status-mini {
   display: flex; align-items: center; justify-content: center;
-  width: 46px; min-height: 160px; height: 100%;
-  writing-mode: vertical-rl; letter-spacing: 5px;
+  width: 46px; flex: 1;
   background: none; border: none; color: var(--muted);
-  cursor: pointer; font-size: 13px; padding: 0;
+  cursor: pointer; padding: 0;
 }
-body.status-collapsed .status-mini:hover { color: var(--accent); }
+body.status-collapsed .status-mini svg { width: 20px; height: 20px; }
+body.status-collapsed .status-mini:hover,
+body.status-collapsed .status-panel:hover { color: var(--accent); border-color: rgba(77,212,172,.4); }
 
 @media (max-width: 900px) {
+  .status-panel { display: none; }
   .main-grid, body.status-collapsed .main-grid { grid-template-columns: minmax(0, 1fr); }
-  body.status-collapsed .status-mini {
-    writing-mode: horizontal-tb; width: 100%; min-height: 0; height: 42px; letter-spacing: 2px;
-  }
 }
 
 @media (max-width: 760px) {
@@ -300,10 +295,10 @@ body.status-collapsed .status-mini:hover { color: var(--accent); }
   .topbar { padding: 10px 12px; gap: 10px; }
 }
 
-/* 手机竖屏：两列各占满宽度，视频区竖长一些 */
+/* 手机竖屏：单列、视频竖长 */
 @media (max-width: 600px) {
   .main-grid { grid-template-columns: 1fr; }
-  .wrap { padding: 8px 6px 24px; gap: 6px; }
+  .wrap { padding: 8px 6px 24px; gap: 8px; }
   .panel { padding: 6px 8px; border-radius: 10px; }
   .stage { aspect-ratio: 3 / 4; max-height: 72vh; }
   .feed { max-height: none; }

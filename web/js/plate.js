@@ -43,16 +43,35 @@ class PlateEngine {
     ort.env.logLevel = 'error';
     // proxy 模式下只支持 wasm EP（推理在 Worker 中执行，不阻塞画面）
     onStep && onStep('载入车牌模型...');
-    // 和人脸模型共用同一个 Cache API 持久化缓存
-    const [detAB, recAB, chars] = await Promise.all([
-      _modelAB('/models/plate_det.onnx'),
-      _modelAB('/models/plate_rec.onnx'),
-      (async () => (await (await fetch('/models/chars.json')).json()))(),
-    ]);
-    const [det, rec] = await Promise.all([
-      ort.InferenceSession.create(detAB, { executionProviders: ['wasm'], graphOptimizationLevel: 'basic' }),
-      ort.InferenceSession.create(recAB, { executionProviders: ['wasm'], graphOptimizationLevel: 'basic' }),
-    ]);
+
+    const isIOS = window._isIOSSafari;
+    const opts = { executionProviders: ['wasm'], graphOptimizationLevel: 'basic' };
+    let det, rec;
+
+    if (isIOS) {
+      // iOS Safari: 串行加载 + 释放 AB，降峰值
+      onStep && onStep('载入车牌检测...');
+      let ab = await _modelAB('/models/plate_det.onnx');
+      det = await ort.InferenceSession.create(ab, opts);
+      ab = null;
+
+      onStep && onStep('载入车牌识别...');
+      ab = await _modelAB('/models/plate_rec.onnx');
+      rec = await ort.InferenceSession.create(ab, opts);
+      ab = null;
+    } else {
+      // 桌面端并行最快
+      const [detAB, recAB] = await Promise.all([
+        _modelAB('/models/plate_det.onnx'),
+        _modelAB('/models/plate_rec.onnx'),
+      ]);
+      [det, rec] = await Promise.all([
+        ort.InferenceSession.create(detAB, opts),
+        ort.InferenceSession.create(recAB, opts),
+      ]);
+    }
+
+    const chars = await (await fetch('/models/chars.json')).json();
     this.det = det;
     this.rec = rec;
     this.detInput = det.inputNames[0];
