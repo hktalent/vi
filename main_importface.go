@@ -118,6 +118,8 @@ func runImportFaces(args []string) int {
 // findHaarCascade 在常见 OpenCV 安装路径中搜索 haarcascade_frontalface_default.xml。
 func findHaarCascade() string {
 	candidates := []string{
+		// 发布包内置（release 把 cascade 打包到 models/haarcascades/）
+		filepath.Join("models", "haarcascades", "haarcascade_frontalface_default.xml"),
 		// Homebrew
 		"/usr/local/share/opencv4/haarcascades/haarcascade_frontalface_default.xml",
 		"/opt/homebrew/share/opencv4/haarcascades/haarcascade_frontalface_default.xml",

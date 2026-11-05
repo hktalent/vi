@@ -2,184 +2,204 @@ name: Release
 
 on:
   push:
-    tags:
-      - "v*"          # push v0.1.0 等 tag 触发
-  workflow_dispatch:  # 也可手动触发，输入 tag 名
+    tags: ["v*"]
 
 permissions:
-  contents: write     # 创建 Release + 上传 assets
+  contents: write
+
+env:
+  QDRANT_VERSION: "v1.15.1"
 
 jobs:
-  # ─── 构建 vi Go 二进制（6 个目标交叉编译）───────────────────────────────────
-  build:
-    name: Build vi (${{ matrix.os }} / ${{ matrix.arch }})
+  models:
+    name: Package face models
     runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+      - name: Archive models
+        run: |
+          set -euo pipefail
+          tar -czf face-models.tar.gz models
+          shasum -a 256 face-models.tar.gz > face-models.tar.gz.sha256
+      - name: Upload models artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: face-models
+          path: |
+            face-models.tar.gz
+            face-models.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 1
+
+  build:
+    name: Build ${{ matrix.os }}/${{ matrix.arch }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          # ── Linux ──
-          - os: linux
-            arch: amd64
-            ext: ""
-            qdrant_asset: "qdrant-x86_64-unknown-linux-gnu.tar.gz"
-          - os: linux
-            arch: arm64
-            ext: ""
-            qdrant_asset: "qdrant-aarch64-unknown-linux-musl.tar.gz"
-          # ── macOS ──
-          - os: darwin
-            arch: amd64
-            ext: ""
-            qdrant_asset: "qdrant-x86_64-apple-darwin.tar.gz"
-          - os: darwin
-            arch: arm64
-            ext: ""
-            qdrant_asset: "qdrant-aarch64-apple-darwin.tar.gz"
-          # ── Windows（Qdrant 目前只出 x86_64，没有 arm64）──
-          - os: windows
-            arch: amd64
-            ext: ".exe"
-            qdrant_asset: "qdrant-x86_64-pc-windows-msvc.zip"
-
+          # CGO 交叉编译不可行，每个平台用原生 runner 构建（含 importfaces，需 OpenCV）
+          - { goos: linux,   goarch: amd64, os: linux,   arch: amd64, runner: ubuntu-latest }
+          - { goos: linux,   goarch: arm64, os: linux,   arch: arm64, runner: ubuntu-24.04-arm }
+          - { goos: darwin,  goarch: amd64, os: darwin,  arch: amd64, runner: macos-13 }
+          - { goos: darwin,  goarch: arm64, os: darwin,  arch: arm64, runner: macos-latest }
+          - { goos: windows, goarch: amd64, os: windows, arch: amd64, runner: windows-latest }
+    runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Go
+      - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.22"
-          cache: true
+          go-version-file: go.mod
+          check-latest: true
           cache-dependency-path: go.sum
 
-      - name: Build vi binary
+      - name: Install OpenCV (Linux)
+        if: matrix.os == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libopencv-dev pkg-config
+
+      - name: Install OpenCV (macOS)
+        if: matrix.os == 'darwin'
+        run: brew install opencv pkg-config
+
+      - name: Cache OpenCV (Windows)
+        if: matrix.os == 'windows'
+        id: opencv-cache
+        uses: actions/cache@v4
+        with:
+          path: C:\opencv
+          key: opencv-4.10.0-mingw-v1
+
+      - name: Setup MinGW (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          choco install -y mingw --no-progress
+          echo "C:\ProgramData\chocolatey\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      # gocv v0.38.0 硬编码链接 C:/opencv/build/install 下的 OpenCV 4.10（含 contrib 模块）。
+      # 源码编译约 30-60 分钟，已加 cache，只有首次/缓存失效才执行。
+      - name: Build OpenCV 4.10 from source (Windows, cache miss)
+        if: matrix.os == 'windows' && steps.opencv-cache.outputs.cache-hit != 'true'
+        shell: cmd
+        run: |
+          mkdir C:\opencv\build 2>nul || ver >nul
+          echo ==^> Download OpenCV sources
+          curl -fsSL -o C:\opencv\opencv.zip https://github.com/opencv/opencv/archive/4.10.0.zip
+          curl -fsSL -o C:\opencv\contrib.zip https://github.com/opencv/opencv_contrib/archive/4.10.0.zip
+          tar -xf C:\opencv\opencv.zip -C C:\opencv
+          tar -xf C:\opencv\contrib.zip -C C:\opencv
+          del C:\opencv\opencv.zip C:\opencv\contrib.zip
+          echo ==^> Configure
+          cmake C:\opencv\opencv-4.10.0 -G "MinGW Makefiles" -BC:\opencv\build -DENABLE_CXX11=ON -DOPENCV_EXTRA_MODULES_PATH=C:\opencv\opencv_contrib-4.10.0\modules -DCMAKE_BUILD_TYPE=RELEASE -DBUILD_SHARED_LIBS=ON -DWITH_IPP=OFF -DWITH_MSMF=OFF -DBUILD_EXAMPLES=OFF -DBUILD_TESTS=OFF -DBUILD_PERF_TESTS=OFF -DBUILD_opencv_java=OFF -DBUILD_opencv_python=OFF -DBUILD_opencv_python2=OFF -DBUILD_opencv_python3=OFF -DBUILD_DOCS=OFF -DENABLE_PRECOMPILED_HEADERS=OFF -DBUILD_opencv_saliency=OFF -DBUILD_LIST=core,imgproc,imgcodecs,videoio,video,highgui,calib3d,features2d,flann,photo,dnn,objdetect,xfeatures2d,aruco,wechat_qrcode,bgsegm,tracking,plot,img_hash,ximgproc,face -DCPU_DISPATCH= -DWITH_OPENCL_D3D11_NV=OFF -Wno-dev
+          echo ==^> Build (this takes a while)
+          cmake --build C:\opencv\build --parallel %NUMBER_OF_PROCESSORS%
+          cmake --build C:\opencv\build --target install
+          rmdir C:\opencv\opencv-4.10.0 /s /q
+          rmdir C:\opencv\opencv_contrib-4.10.0 /s /q
+
+      - name: Prepare patched gocv
+        run: ./scripts/patch-gocv.sh
+
+      - name: Build vi
         env:
-          GOOS:   ${{ matrix.os }}
-          GOARCH: ${{ matrix.arch }}
-          CGO_ENABLED: "0"
+          CGO_ENABLED: "1"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
         run: |
-          mkdir -p dist/bin
-          NAME="vi-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.ext }}"
-          go build \
-            -ldflags "-s -w -X main.Version=${GITHUB_REF_NAME}" \
-            -trimpath \
-            -o "dist/bin/${NAME}" \
-            .
-          ls -lh dist/bin/
+          go build -tags importface -trimpath -ldflags "-s -w -X main.Version=${{ github.ref_name }}" -o dist/bin/vi${{ matrix.os == 'windows' && '.exe' || '' }} .
 
-      - name: Download bundled Qdrant
+      - name: Bundle OpenCV DLLs (Windows)
+        if: matrix.os == 'windows'
+        run: cp /c/opencv/build/install/x64/mingw/bin/*.dll dist/bin/
+
+      - name: Download qdrant
+        env:
+          QDRANT_VERSION: ${{ env.QDRANT_VERSION }}
         run: |
-          ASSET="${{ matrix.qdrant_asset }}"
-          QDRANT_URL="https://github.com/qdrant/qdrant/releases/download/v1.12.4/${ASSET}"
-          echo "下载 Qdrant: $QDRANT_URL"
-          mkdir -p dist/bin
-          cd dist/bin
-          curl -fL -o "$ASSET" "$QDRANT_URL"
-          case "$ASSET" in
-            *.tar.gz) tar xzf "$ASSET" ;;
-            *.zip)    unzip -o  "$ASSET" ;;
+          set -euo pipefail
+          os="${{ matrix.os }}"
+          arch="${{ matrix.arch }}"
+          case "$os" in
+            darwin) qdrant_os="darwin"; ext="tar.gz" ;;
+            linux) qdrant_os="linux"; ext="tar.gz" ;;
+            windows) qdrant_os="windows"; ext="zip" ;;
           esac
-          # 有些 Qdrant tar 把二进制直接放在根目录（./qdrant），有些放子目录（./qdrant-x86_64-linux-gnu/qdrant）
-          # 找到 qdrant 二进制，重命名为统一名字。不能 cp 同名文件 → 同一个文件报错
-          TARGET="qdrant${{ matrix.ext }}"
-          QD_BIN="$(find . -maxdepth 2 -type f -name 'qdrant*' ! -name '*.tar.gz' ! -name '*.zip' | head -1)"
-          if [ -z "$QD_BIN" ]; then
-            echo "⚠️  未在 ${ASSET} 中找到 qdrant 二进制，跳过"
-          elif [ "$(basename "$QD_BIN")" = "$TARGET" ]; then
-            # 已经是正确名字/位置，只加执行权限
-            echo "已经是 $TARGET，直接赋权"
-            chmod +x "$QD_BIN" || true
-          else
-            echo "cp $QD_BIN → $TARGET"
-            chmod +x "$QD_BIN" || true
-            cp "$QD_BIN" "$TARGET"
-          fi
-          ls -lh
+          case "$arch" in
+            amd64) qdrant_arch="x86_64" ;;
+            arm64) qdrant_arch="aarch64" ;;
+          esac
+          asset="qdrant-${qdrant_arch}-unknown-${qdrant_os}-musl.${ext}"
+          url="https://github.com/qdrant/qdrant/releases/download/${QDRANT_VERSION}/${asset}"
+          echo "Downloading $url"
+          curl -fL "$url" -o "qdrant.${ext}"
+          mkdir -p qdrant-dist
+          case "$ext" in
+            tar.gz) tar -xzf "qdrant.${ext}" -C qdrant-dist ;;
+            zip) unzip -o "qdrant.${ext}" -d qdrant-dist ;;
+          esac
+          binpath=$(find qdrant-dist -type f -name "qdrant*" | head -n1)
+          mkdir -p dist/bin
+          cp "$binpath" "dist/bin/qdrant"
+          chmod +x dist/bin/qdrant || true
 
-      - name: Assemble release tree
+      - name: Assemble package
         run: |
-          PKG="vi-${{ matrix.os }}-${{ matrix.arch }}"
-          mkdir -p "dist/${PKG}/bin" "dist/${PKG}/data/images" "dist/${PKG}/data/reports"
-          cp dist/bin/vi-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.ext }} "dist/${PKG}/bin/vi${{ matrix.ext }}"
-          cp dist/bin/qdrant${{ matrix.ext }} "dist/${PKG}/bin/" || true
-          cp -r web   "dist/${PKG}/"
-          cp -r scripts "dist/${PKG}/" || true
-          cp start.sh  "dist/${PKG}/"
-          cp stop.sh   "dist/${PKG}/"
-          cp README.md "dist/${PKG}/"
-          printf '* text=auto eol=lf\n*.{exe,dll,so,dylib} binary\n' > "dist/${PKG}/.gitattributes"
-          # shell 脚本统一 LF
-          if [ "${{ matrix.os }}" != "windows" ]; then
-            sed -i 's/\r$//' "dist/${PKG}/start.sh" "dist/${PKG}/stop.sh"
-          fi
-          chmod +x "dist/${PKG}/start.sh" "dist/${PKG}/stop.sh" || true
-          echo "── Release tree ──"
-          find "dist/${PKG}" -maxdepth 2 | sort
+          set -euo pipefail
+          PKG="vi-${{ github.ref_name }}-${{ matrix.os }}-${{ matrix.arch }}"
+          echo "PKG=$PKG" >> "$GITHUB_ENV"
+          mkdir -p "dist/$PKG"
+          cp -r web statics config.example.yaml README.md dist/bin "dist/$PKG/"
+          cp -r scripts "dist/$PKG/" 2>/dev/null || true
+          mkdir -p "dist/$PKG/models/haarcascades"
+          base="https://raw.githubusercontent.com/opencv/opencv/4.10.0/data/haarcascades"
+          for f in haarcascade_frontalface_default.xml haarcascade_frontalface_alt.xml haarcascade_frontalface_alt2.xml haarcascade_eye.xml haarcascade_smile.xml; do
+            curl -fsSL "$base/$f" -o "dist/$PKG/models/haarcascades/$f"
+          done
+          if [ -f start.sh ]; then cp start.sh "dist/$PKG/"; fi
+          rm -f "dist/$PKG/scripts/package.sh"
 
-      - name: Archive
+      - name: Archive package
         run: |
-          PKG="vi-${{ matrix.os }}-${{ matrix.arch }}"
-          TAG="${GITHUB_REF_NAME:-manual}"
-          if [ "${{ matrix.os }}" = "windows" ]; then
-            (cd dist && zip -r "../${PKG}-${TAG}.zip" "${PKG}")
-            echo "artifact=${PKG}-${TAG}.zip" >> "$GITHUB_OUTPUT"
-          else
-            tar czf "${PKG}-${TAG}.tar.gz" -C dist "${PKG}"
-            echo "artifact=${PKG}-${TAG}.tar.gz" >> "$GITHUB_OUTPUT"
-          fi
-          ls -lh
+          set -euo pipefail
+          cd dist
+          case "${{ matrix.os }}" in
+            windows) zip -qr "${PKG}.zip" "$PKG" ;;
+            *) tar -czf "${PKG}.tar.gz" "$PKG" ;;
+          esac
+          shasum -a 256 "${PKG}".* > "${PKG}.sha256"
 
-      - name: Upload artifact
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: vi-${{ matrix.os }}-${{ matrix.arch }}
-          path: dist/*.${{ matrix.os }}
-          include-hidden-files: true
+          name: build-${{ matrix.os }}-${{ matrix.arch }}
+          path: |
+            dist/${{ env.PKG }}.tar.gz
+            dist/${{ env.PKG }}.zip
+            dist/${{ env.PKG }}.sha256
+          if-no-files-found: ignore
+          retention-days: 1
 
-  # ─── 模型包（单独一个 asset，~400MB）───────────────────────────────────────────
-  models:
-    name: Package models
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout (depth=0 to pull LFS)
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          lfs: true
-
-      - name: Tar models
-        run: |
-          TAG="${GITHUB_REF_NAME:-manual}"
-          tar czf "vi-models-${TAG}.tar.gz" models/
-          ls -lh vi-models-${TAG}.tar.gz
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: vi-models
-          path: vi-models-*.tar.gz
-
-  # ─── 发布 GitHub Release ─────────────────────────────────────────────────────
   release:
-    name: Create GitHub Release
-    needs: [build, models]
+    name: Publish GitHub Release
+    needs: [models, build]
     runs-on: ubuntu-latest
     steps:
-      - name: Download all artifacts
+      - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
-          path: assets
+          path: artifacts
+          merge-multiple: true
 
-      - name: List assets
-        run: find assets -type f -ls
-
-      - name: Create Release
+      - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name:  ${{ github.ref_name }}
-          name:      vi ${{ github.ref_name }}
+          files: artifacts/*
           generate_release_notes: true
-          files:     assets/**/*
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          fail_on_unmatched_files: false
