@@ -84,9 +84,7 @@ func main() {
 		case "serve":
 			os.Exit(runServe())
 		case "importfaces", "import":
-			fmt.Fprintln(os.Stderr, "importfaces 子命令需要编译时加 -tags importface（需要 CGO + OpenCV）")
-			fmt.Fprintln(os.Stderr, "本地构建: ./build-importface.sh")
-			os.Exit(1)
+			os.Exit(runImportFaces(os.Args[2:]))
 		case "reset":
 			os.Exit(runReset(os.Args[2:]))
 		case "version", "--version", "-v":

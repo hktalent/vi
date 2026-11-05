@@ -36,18 +36,25 @@
     </section>
 
     <section class="panel" style="margin-top: 16px;">
-      <h2 id="resultTitle">结果</h2>
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;">
+        <h2 id="resultTitle" style="margin:0;">结果</h2>
+        <div style="display:flex;gap:8px;align-items:center;">
+          <button class="btn small" id="btnSelectAll">全选</button>
+          <button class="btn small danger" id="btnDelete" style="display:none;">删除选中</button>
+        </div>
+      </div>
       <div style="overflow:auto;">
         <table>
           <thead>
-            <tr><th>时间</th><th>类型</th><th>对象</th><th>地址</th><th>坐标</th><th>图片</th></tr>
+            <tr><th style="width:30px;"></th><th>时间</th><th>类型</th><th>对象</th><th>地址</th><th>坐标</th><th>图片</th></tr>
           </thead>
-          <tbody id="rows"><tr><td colspan="6" class="muted">输入条件后查询。</td></tr></tbody>
+          <tbody id="rows"><tr><td colspan="7" class="muted">输入条件后查询。</td></tr></tbody>
         </table>
       </div>
       <div class="pager">
         <span id="pageInfo"></span>
         <button class="btn small" id="prev">上一页</button>
+        <span id="pageNumbers" style="display:inline-flex;gap:4px;align-items:center;"></span>
         <button class="btn small" id="next">下一页</button>
       </div>
     </section>

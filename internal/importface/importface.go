@@ -22,17 +22,21 @@ import (
 
 // Importer 把本地文件夹里的图片扫描一遍，检测人脸 → 裁剪 → 提取 embedding → upsert 到 Qdrant。
 type Importer struct {
-	cfg      config.Config
-	qd       *qdrant.Qdrant
-	st       *store.Store
-	cascade  *gocv.CascadeClassifier
-	net      *gocv.Net
-	label    string // 可选标签，作为每张新脸的 PersonID 前缀
-	dryRun   bool
-	force    bool              // 强制重新导入（忽略已有记录）
-	existing map[string]bool   // 已导入的 person_id 集合（幂等去重）
-	skipped  int               // 跳过数量统计
-	filtered int               // 被 norm 过滤丢弃的数量统计
+	cfg        config.Config
+	qd         *qdrant.Qdrant
+	st         *store.Store
+	cascade    *gocv.CascadeClassifier
+	cascadeAlt *gocv.CascadeClassifier // 第二投票 cascade
+	cascadeAlt2 *gocv.CascadeClassifier // 第三投票 cascade
+	eyeCascade  *gocv.CascadeClassifier // 眼睛（含戴眼镜）
+	mouthCascade *gocv.CascadeClassifier // 嘴巴/微笑
+	net         *gocv.Net
+	label      string // 可选标签，作为每张新脸的 PersonID 前缀
+	dryRun     bool
+	force      bool              // 强制重新导入（忽略已有记录）
+	existing   map[string]bool   // 已导入的 person_id 集合（幂等去重）
+	skipped    int               // 跳过数量统计
+	filtered   int               // 被 norm 过滤丢弃的数量统计
 }
 
 // NewImporter 创建 Importer。
@@ -43,12 +47,33 @@ func NewImporter(cfg config.Config, qd *qdrant.Qdrant, st *store.Store, cascadeX
 	if !cc.Load(cascadeXML) {
 		return nil, fmt.Errorf("加载 Haar cascade 失败: %s", cascadeXML)
 	}
+	// 加载第二、第三投票 cascade（同目录）
+	cascadeDir := filepath.Dir(cascadeXML)
+	ccAlt := gocv.NewCascadeClassifier()
+	if !ccAlt.Load(filepath.Join(cascadeDir, "haarcascade_frontalface_alt.xml")) {
+		log.Printf("[import] ⚠️  alt cascade 加载失败，投票降级为单 cascade")
+	}
+	ccAlt2 := gocv.NewCascadeClassifier()
+	if !ccAlt2.Load(filepath.Join(cascadeDir, "haarcascade_frontalface_alt2.xml")) {
+		log.Printf("[import] ⚠️  alt2 cascade 加载失败，投票降级为单 cascade")
+	}
+	// 从 face cascade 路径推导 eye/mouth cascade 路径（同目录）
+	eyeXML := filepath.Join(cascadeDir, "haarcascade_eye.xml")
+	ec := gocv.NewCascadeClassifier()
+	if !ec.Load(eyeXML) {
+		return nil, fmt.Errorf("加载 eye cascade 失败: %s", eyeXML)
+	}
+	mouthXML := filepath.Join(cascadeDir, "haarcascade_smile.xml")
+	mc := gocv.NewCascadeClassifier()
+	if !mc.Load(mouthXML) {
+		return nil, fmt.Errorf("加载 mouth cascade 失败: %s", mouthXML)
+	}
 	net := gocv.ReadNetFromONNX(arcOnnx)
 	if net.Empty() {
 		return nil, fmt.Errorf("加载 arc.onnx 失败: %s", arcOnnx)
 	}
 	log.Printf("[import] OpenCV DNN 已加载 arc.onnx")
-	im := &Importer{cfg: cfg, qd: qd, st: st, cascade: &cc, net: &net, label: label, dryRun: dryRun, force: force}
+	im := &Importer{cfg: cfg, qd: qd, st: st, cascade: &cc, cascadeAlt: &ccAlt, cascadeAlt2: &ccAlt2, eyeCascade: &ec, mouthCascade: &mc, net: &net, label: label, dryRun: dryRun, force: force}
 
 	// 加载已有 person_id 集合（幂等去重）
 	if st != nil && !force {
@@ -172,6 +197,42 @@ func (im *Importer) processImage(path string) (int, error) {
 
 		cropRect := image.Rect(x, y, x2, y2)
 		crop := img.Region(cropRect)
+
+		// 多 cascade 投票：alt/alt2 cascade 也检测一下，至少 2/3 通过才保留
+		votes := 1 // 主 cascade 已投 1 票
+		if im.cascadeAlt != nil {
+			altRects := im.cascadeAlt.DetectMultiScaleWithParams(crop, 1.1, 4, 0, image.Pt(20, 20), image.Pt(0, 0))
+			if len(altRects) > 0 {
+				votes++
+			}
+		}
+		if im.cascadeAlt2 != nil {
+			alt2Rects := im.cascadeAlt2.DetectMultiScaleWithParams(crop, 1.1, 4, 0, image.Pt(20, 20), image.Pt(0, 0))
+			if len(alt2Rects) > 0 {
+				votes++
+			}
+		}
+		if votes < 2 {
+			im.filtered++
+			crop.Close()
+			continue
+		}
+
+		// 肤色检测：人脸包含一定比例的肤色像素，非人脸（纯白/纯黑/纹理）没有
+		if !hasSkinTone(crop) {
+			im.filtered++
+			crop.Close()
+			continue
+		}
+
+		// 面部特征几何验证：水平成对的眼睛，或眼睛+嘴巴的正确位置关系。
+		// 领带/花朵/布料的纹理误检无法通过几何约束。
+		if !im.hasFacialFeatures(crop) {
+			im.filtered++
+			crop.Close()
+			continue
+		}
+
 		embedding, err := im.extractEmbedding(crop)
 		if err != nil {
 			log.Printf("[import] extractEmbedding 失败: %v", err)
@@ -407,6 +468,129 @@ func l2Norm(v []float32) float64 {
 		sum += float64(x) * float64(x)
 	}
 	return math.Sqrt(sum)
+}
+
+// hasSkinTone 检查图像中是否含有足够比例的肤色像素。
+// 人脸在 HSV 色彩空间中 H∈[0,50], S∈[0.23,0.68], V∈[0.35,1.0] 范围内有稳定的肤色分布。
+// 非人脸区域（纯白婚纱、纯黑背景、手写线条、花纹布料）的肤色比例极低。
+// 返回 true 表示肤色比例 >= 15%，可能是人脸。
+func hasSkinTone(crop gocv.Mat) bool {
+	hsv := gocv.NewMat()
+	defer hsv.Close()
+	gocv.CvtColor(crop, &hsv, gocv.ColorBGRToHSV)
+
+	// 肤色范围（HSV）：H 0-50, S 58-173, V 90-255
+	mask := gocv.NewMat()
+	defer mask.Close()
+	gocv.InRangeWithScalar(hsv, gocv.NewScalar(0, 58, 90, 0), gocv.NewScalar(50, 173, 255, 0), &mask)
+
+	totalPixels := mask.Rows() * mask.Cols()
+	if totalPixels == 0 {
+		return false
+	}
+	skinPixels := gocv.CountNonZero(mask)
+	ratio := float64(skinPixels) / float64(totalPixels)
+	return ratio >= 0.15
+}
+
+// hasFacialFeatures 用几何约束验证面部特征，过滤领带/花朵/布料等误检。
+//
+// 通过条件（任一）：
+//  1. 眼睛成对：两只眼睛水平对齐、间距合理（0.15-0.50 脸宽）、大小相近、整体居中。
+//     领带纹理的"眼睛"是竖直排列或尺寸过小（<0.07 脸宽）的噪声；
+//     玫瑰花辨的"眼睛"分布在画面边缘、间距过宽，均无法通过。
+//  2. 眼睛 + 嘴巴位置关系正确：1 只居中的眼睛 + 嘴巴在其下方。
+//     覆盖侧脸（只能看到 1 只眼睛）场景。
+//
+// 关键约束是尺寸归一化：真人眼睛宽约 0.07-0.35 脸宽，嘴巴宽约 0.15-0.60 脸宽；
+// 高分辨率图片上花纹/布料触发的误检尺寸远小于此。
+func (im *Importer) hasFacialFeatures(crop gocv.Mat) bool {
+	faceW := float64(crop.Cols())
+	faceH := float64(crop.Rows())
+
+	gray := gocv.NewMat()
+	defer gray.Close()
+	gocv.CvtColor(crop, &gray, gocv.ColorBGRToGray)
+
+	// 1. 眼睛检测（上 65% 区域）
+	upperH := int(faceH * 0.65)
+	if upperH < 10 {
+		upperH = int(faceH)
+	}
+	upper := gray.Region(image.Rect(0, 0, int(faceW), upperH))
+	defer upper.Close()
+	eyeRects := im.eyeCascade.DetectMultiScaleWithParams(upper, 1.1, 4, 0, image.Pt(10, 10), image.Pt(0, 0))
+
+	type feat struct{ x, y, w float64 }
+	eyes := make([]feat, 0, len(eyeRects))
+	for _, r := range eyeRects {
+		cx := (float64(r.Min.X) + float64(r.Dx())/2) / faceW
+		cy := (float64(r.Min.Y) + float64(r.Dy())/2) / faceH // region 从 y=0 起，无需偏移
+		w := float64(r.Dx()) / faceW
+		// 尺寸 + 位置约束：过滤花纹噪声
+		if w < 0.07 || w > 0.35 {
+			continue
+		}
+		if cy < 0.10 || cy > 0.60 || cx < 0.10 || cx > 0.90 {
+			continue
+		}
+		eyes = append(eyes, feat{cx, cy, w})
+	}
+
+	// 条件 1：水平成对的眼睛（间距、对齐、大小、居中）
+	for i := 0; i < len(eyes); i++ {
+		for j := i + 1; j < len(eyes); j++ {
+			dy := math.Abs(eyes[i].y - eyes[j].y)
+			dx := math.Abs(eyes[i].x - eyes[j].x)
+			centerX := (eyes[i].x + eyes[j].x) / 2
+			sizeRatio := eyes[i].w / eyes[j].w
+			if sizeRatio < 1 {
+				sizeRatio = 1 / sizeRatio
+			}
+			if dy < 0.15 && dx >= 0.15 && dx <= 0.50 && sizeRatio < 2.0 && centerX >= 0.28 && centerX <= 0.72 {
+				return true
+			}
+		}
+	}
+
+	// 2. 嘴巴检测（下 55% 区域，minNeighbors=6 抑制纹理误检）
+	lowerY := int(faceH * 0.45)
+	lowerH := int(faceH) - lowerY
+	if lowerH < 10 {
+		lowerY = 0
+		lowerH = int(faceH)
+	}
+	lower := gray.Region(image.Rect(0, lowerY, int(faceW), lowerY+lowerH))
+	defer lower.Close()
+	mouthRects := im.mouthCascade.DetectMultiScaleWithParams(lower, 1.1, 6, 0, image.Pt(12, 12), image.Pt(0, 0))
+
+	mouths := make([]feat, 0, len(mouthRects))
+	for _, r := range mouthRects {
+		cx := (float64(r.Min.X) + float64(r.Dx())/2) / faceW
+		cy := (float64(lowerY+r.Min.Y) + float64(r.Dy())/2) / faceH // 还原到全图坐标
+		w := float64(r.Dx()) / faceW
+		if w < 0.15 || w > 0.60 {
+			continue
+		}
+		if cy < 0.55 || cy > 0.95 || cx < 0.28 || cx > 0.72 {
+			continue
+		}
+		mouths = append(mouths, feat{cx, cy, w})
+	}
+
+	// 条件 2：1 只居中的眼睛 + 嘴巴在其下方（侧脸/单眼场景）
+	for _, e := range eyes {
+		if e.x < 0.30 || e.x > 0.70 {
+			continue
+		}
+		for _, m := range mouths {
+			if m.y-e.y > 0.15 && math.Abs(m.x-e.x) < 0.35 {
+				return true
+			}
+		}
+	}
+
+	return false
 }
 
 // uuid4 生成一个 UUID v4 字符串（随机 122 bit + 固定 version/variant）。

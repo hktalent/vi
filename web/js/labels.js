@@ -1,7 +1,7 @@
-let kind = 'face';
 let page = 1;
 let total = 0;
 const PAGE_SIZE = 20;
+let selected = new Set(); // 选中的 event_id
 
 async function loadLabels() {
   const tbody = document.getElementById('labelRows');
@@ -29,15 +29,53 @@ async function loadLabels() {
   }
 }
 
+function updateBatchBar() {
+  const has = selected.size > 0;
+  document.getElementById('batchLabel').style.display = has ? 'block' : 'none';
+  document.getElementById('btnBatchLabel').style.display = has ? 'inline-block' : 'none';
+  document.getElementById('btnDelete').style.display = has ? 'inline-block' : 'none';
+  if (has) document.getElementById('btnDelete').textContent = `删除选中 (${selected.size})`;
+}
+
+function renderPageNumbers(totalPages) {
+  const el = document.getElementById('pageNumbers');
+  if (totalPages <= 1) { el.innerHTML = ''; return; }
+  let html = '';
+  const maxShow = 7;
+  let start = Math.max(1, page - 3);
+  let end = Math.min(totalPages, start + maxShow - 1);
+  if (end - start < maxShow - 1) start = Math.max(1, end - maxShow + 1);
+
+  if (start > 1) {
+    html += `<button class="btn small" onclick="goPage(1)">1</button>`;
+    if (start > 2) html += `<span class="muted">…</span>`;
+  }
+  for (let i = start; i <= end; i++) {
+    html += `<button class="btn small ${i === page ? 'primary' : ''}" onclick="goPage(${i})">${i}</button>`;
+  }
+  if (end < totalPages) {
+    if (end < totalPages - 1) html += `<span class="muted">…</span>`;
+    html += `<button class="btn small" onclick="goPage(${totalPages})">${totalPages}</button>`;
+  }
+  el.innerHTML = html;
+}
+
+function goPage(p) {
+  page = p;
+  loadIdentities();
+}
+
 async function loadIdentities() {
   const wrap = document.getElementById('cards');
   const q = document.getElementById('q').value.trim();
   try {
     const data = await api.get(`/api/identities?kind=${kind}&page=${page}&q=${encodeURIComponent(q)}`);
     total = data.total;
+    const totalPages = Math.ceil(total / PAGE_SIZE);
     document.getElementById('pageInfo').textContent = `共 ${total} 个身份 · 第 ${page} 页`;
     document.getElementById('prev').disabled = page <= 1;
-    document.getElementById('next').disabled = page * PAGE_SIZE >= total;
+    document.getElementById('next').disabled = page >= totalPages;
+    renderPageNumbers(totalPages);
     if (!data.items.length) {
       wrap.innerHTML = '<div class="note">没有匹配的身份。</div>';
       return;
@@ -54,8 +92,9 @@ async function loadIdentities() {
         it.age_range ? it.age_range + '岁' : '',
         it.glasses === 'yes' ? '戴眼镜' : it.glasses === 'no' ? '无眼镜' : ''
       ].filter(Boolean).join(' · ') : '';
+      const checked = selected.has(it.event_id) ? 'checked' : '';
       return `
-      <div class="card">
+      <div class="card" data-eid="${it.event_id}">
         <a href="${it._signedImage}" target="_blank"><img class="cover" src="${it._signedImage}" alt="" /></a>
         <div class="body">
           <div class="name">${kind === 'plate' ? esc(it.plate_text || it.key) : (labels.length ? esc(labels.join('、')) : '未命名人脸')}</div>
@@ -69,6 +108,11 @@ async function loadIdentities() {
             <button class="btn small primary" data-save="${it.event_id}">保存</button>
           </div>
           <div class="meta mono" title="${esc(it.key)}">ID ${esc(it.key.slice(0, 18))}…</div>
+          <div style="margin-top:6px;">
+            <label style="cursor:pointer;font-size:12px;color:var(--muted);">
+              <input type="checkbox" class="selBox" data-id="${it.event_id}" ${checked} /> 选择
+            </label>
+          </div>
         </div>
       </div>`;
     }).join('');
@@ -113,12 +157,67 @@ document.addEventListener('change', async ev => {
   } catch (e) { toast('更新失败：' + esc(e.message), 'err'); }
 });
 
+// 多选
+document.addEventListener('change', ev => {
+  const box = ev.target.closest('.selBox');
+  if (!box) return;
+  const id = box.dataset.id;
+  if (box.checked) selected.add(id);
+  else selected.delete(id);
+  updateBatchBar();
+});
+
+// 全选
+document.getElementById('btnSelectAll').addEventListener('click', () => {
+  const boxes = document.querySelectorAll('.selBox');
+  const allChecked = selected.size === boxes.length && boxes.length > 0;
+  boxes.forEach(cb => {
+    cb.checked = !allChecked;
+    if (!allChecked) selected.add(cb.dataset.id);
+    else selected.delete(cb.dataset.id);
+  });
+  updateBatchBar();
+});
+
+// 批量打标
+document.getElementById('btnBatchLabel').addEventListener('click', async () => {
+  const name = document.getElementById('batchLabel').value.trim();
+  if (!name) { toast('请输入标签名', 'err'); return; }
+  if (!selected.size) { toast('请先选择头像', 'err'); return; }
+  try {
+    for (const id of selected) {
+      await api.post('/api/labels', { name, event_id: id, beep: true });
+    }
+    toast(`已为 ${selected.size} 个身份打上「${esc(name)}」`);
+    selected.clear();
+    document.getElementById('batchLabel').value = '';
+    updateBatchBar();
+    loadLabels();
+    loadIdentities();
+  } catch (e) { toast('批量打标失败：' + esc(e.message), 'err'); }
+});
+
+// 批量删除
+document.getElementById('btnDelete').addEventListener('click', async () => {
+  if (!selected.size) return;
+  if (!confirm(`确定删除选中的 ${selected.size} 条记录？此操作不可恢复。`)) return;
+  try {
+    const data = await api.post('/api/events/batch-delete', { ids: [...selected] });
+    toast(`已删除 ${data.deleted} 条`);
+    selected.clear();
+    updateBatchBar();
+    loadIdentities();
+  } catch (e) { toast('删除失败：' + esc(e.message), 'err'); }
+});
+
 document.querySelectorAll('.tabs [data-kind]').forEach(btn => {
   btn.addEventListener('click', () => {
     document.querySelectorAll('.tabs [data-kind]').forEach(b => b.classList.remove('active'));
     btn.classList.add('active');
     kind = btn.dataset.kind;
     page = 1;
+    selected.clear();
+    updateBatchBar();
     loadIdentities();
   });
 });

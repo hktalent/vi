@@ -1,7 +1,7 @@
-let mode = 'date';
 let page = 1;
 let total = 0;
 const SIZE = 20;
+let selected = new Set(); // 选中的事件 ID
 
 const q = document.getElementById('q');
 
@@ -20,12 +20,43 @@ function applyMode() {
   document.getElementById('hint').textContent = c.hint;
 }
 
+function updateDeleteBtn() {
+  const btn = document.getElementById('btnDelete');
+  btn.style.display = selected.size > 0 ? 'inline-block' : 'none';
+  btn.textContent = `删除选中 (${selected.size})`;
+}
+
+function renderPageNumbers(totalPages) {
+  const el = document.getElementById('pageNumbers');
+  if (totalPages <= 1) { el.innerHTML = ''; return; }
+  let html = '';
+  const maxShow = 7; // 最多显示 7 个页码
+  let start = Math.max(1, page - 3);
+  let end = Math.min(totalPages, start + maxShow - 1);
+  if (end - start < maxShow - 1) start = Math.max(1, end - maxShow + 1);
+
+  if (start > 1) {
+    html += `<button class="btn small" onclick="search(1)">1</button>`;
+    if (start > 2) html += `<span class="muted">…</span>`;
+  }
+  for (let i = start; i <= end; i++) {
+    html += `<button class="btn small ${i === page ? 'primary' : ''}" onclick="search(${i})">${i}</button>`;
+  }
+  if (end < totalPages) {
+    if (end < totalPages - 1) html += `<span class="muted">…</span>`;
+    html += `<button class="btn small" onclick="search(${totalPages})">${totalPages}</button>`;
+  }
+  el.innerHTML = html;
+}
+
 async function search(p = 1) {
   page = p;
+  selected.clear();
+  updateDeleteBtn();
   const v = q.value.trim();
   const tbody = document.getElementById('rows');
   if (!v) {
-    tbody.innerHTML = '<tr><td colspan="6" class="muted">请输入查询条件。</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="7" class="muted">请输入查询条件。</td></tr>';
     return;
   }
   let url = '';
@@ -37,13 +68,15 @@ async function search(p = 1) {
   try {
     const data = await api.get(url);
     total = data.total;
+    const totalPages = Math.ceil(total / SIZE);
     document.getElementById('resultTitle').textContent =
       `结果 · 共 ${data.total} 条 · 第 ${data.page} 页（每页 ${data.page_size}）`;
     document.getElementById('pageInfo').textContent = data.total ? `${(page - 1) * SIZE + 1} - ${(page - 1) * SIZE + data.items.length}` : '';
     document.getElementById('prev').disabled = page <= 1;
     document.getElementById('next').disabled = !data.has_more;
+    renderPageNumbers(totalPages);
     if (!data.items.length) {
-      tbody.innerHTML = '<tr><td colspan="6" class="muted">没有匹配的记录。</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="7" class="muted">没有匹配的记录。</td></tr>';
       return;
     }
     // 批量换签名 URL
@@ -64,6 +97,7 @@ async function search(p = 1) {
       ].filter(Boolean).join(' · ');
       return `
         <tr class="${isPlate ? 'plate' : 'face'}">
+          <td><input type="checkbox" data-id="${e.id}" onchange="toggleSelect('${e.id}', this.checked)"></td>
           <td class="mono">${esc(e.captured_at)}</td>
           <td><span class="badge ${e.kind}">${isPlate ? '车牌' : '人脸'}</span></td>
           <td>${obj}${attrs ? `<div class="muted" style="font-size:11px;">${esc(attrs)}</div>` : ''}${e.sim ? `<div class="muted" style="font-size:11px;">相似度 ${(e.sim * 100).toFixed(1)}%</div>` : ''}</td>
@@ -73,7 +107,35 @@ async function search(p = 1) {
         </tr>`;
     }).join('');
   } catch (e) {
-    tbody.innerHTML = `<tr><td colspan="6" class="muted">查询失败：${esc(e.message)}</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="7" class="muted">查询失败：${esc(e.message)}</td></tr>`;
+  }
+}
+
+function toggleSelect(id, checked) {
+  if (checked) selected.add(id);
+  else selected.delete(id);
+  updateDeleteBtn();
+}
+
+function selectAll() {
+  const boxes = document.querySelectorAll('#rows input[type="checkbox"]');
+  const allChecked = selected.size === boxes.length && boxes.length > 0;
+  boxes.forEach(cb => {
+    cb.checked = !allChecked;
+    toggleSelect(cb.dataset.id, !allChecked);
+  });
+}
+
+async function deleteSelected() {
+  if (selected.size === 0) return;
+  if (!confirm(`确定删除选中的 ${selected.size} 条记录？此操作不可恢复。`)) return;
+  try {
+    const data = await api.post('/api/events/batch-delete', { ids: [...selected] });
+    toast(`已删除 ${data.deleted} 条`);
+    selected.clear();
+    search(page);
+  } catch (e) {
+    toast('删除失败: ' + e.message);
   }
 }
 
@@ -83,8 +145,9 @@ document.querySelectorAll('.tabs [data-mode]').forEach(btn => {
     btn.classList.add('active');
     mode = btn.dataset.mode;
     applyMode();
-    document.getElementById('rows').innerHTML = '<tr><td colspan="6" class="muted">输入条件后查询。</td></tr>';
+    document.getElementById('rows').innerHTML = '<tr><td colspan="7" class="muted">输入条件后查询。</td></tr>';
     document.getElementById('resultTitle').textContent = '结果';
+    document.getElementById('pageNumbers').innerHTML = '';
   });
 });
 
@@ -92,5 +155,7 @@ document.getElementById('btnSearch').addEventListener('click', () => search(1));
 q.addEventListener('keydown', e => { if (e.key === 'Enter') search(1); });
 document.getElementById('prev').addEventListener('click', () => { if (page > 1) search(page - 1); });
 document.getElementById('next').addEventListener('click', () => { if (page * SIZE <= total) search(page + 1); });
+document.getElementById('btnSelectAll').addEventListener('click', selectAll);
+document.getElementById('btnDelete').addEventListener('click', deleteSelected);
 
 applyMode();

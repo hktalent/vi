@@ -260,9 +260,33 @@ class FaceEngine {
       // 对齐结果快照，供低频的 embedding/属性推理使用（detect 本身只做检测+对齐）
       const snap = new OffscreenCanvas(112, 112);
       snap.getContext('2d').drawImage(this.alignCanvas, 0, 0);
+
+      // 肤色检测：过滤误检（领带、花朵、布料等无肤色区域）
+      if (!this._hasSkinTone(video, box)) continue;
+
       out.push({ box, snap });
     }
     return out;
+  }
+
+  // _hasSkinTone 检查裁剪区域中肤色像素比例（RGB 简化判断，避免 HSV 转换开销）
+  _hasSkinTone(video, box) {
+    const { x, y, w, h } = box;
+    if (w < 20 || h < 20) return false;
+    const canvas = new OffscreenCanvas(w, h);
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(video, x, y, w, h, 0, 0, w, h);
+    const data = ctx.getImageData(0, 0, w, h).data;
+    let skinCount = 0;
+    const total = w * h;
+    for (let i = 0; i < data.length; i += 4) {
+      const r = data[i], g = data[i + 1], b = data[i + 2];
+      // RGB 肤色近似判断：R > G > B 且有一定饱和度
+      if (r > 95 && g > 40 && b > 20 && r > g && r > b && (r - Math.min(g, b)) > 15) {
+        skinCount++;
+      }
+    }
+    return (skinCount / total) >= 0.15;
   }
 
   async embed(snap) {
@@ -279,6 +303,8 @@ class FaceEngine {
     let norm = 0;
     for (let i = 0; i < vec.length; i++) norm += vec[i] * vec[i];
     norm = Math.sqrt(norm) || 1;
+    // embedding norm 过滤：非人脸区域（领带/花朵/布料）的 norm 通常异常
+    if (norm < 1.5 || norm > 8.0) return null;
     return Array.from(vec, v => v / norm);
   }
 

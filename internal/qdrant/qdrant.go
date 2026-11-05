@@ -161,6 +161,28 @@ func (q *Qdrant) QueryPlate(indices []uint32, values []float32, limit int) ([]Po
 	return resp.Result.Points, nil
 }
 
+// DeletePoints 从指定 collection 删除一批 point。
+// ids 是 point_id 列表（UUID 字符串）。
+func (q *Qdrant) DeletePoints(collection string, ids []string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	body := map[string]any{"points": ids}
+	b, _ := json.Marshal(body)
+	req, _ := http.NewRequest("POST", q.base+"/collections/"+collection+"/points/delete", bytes.NewReader(b))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := q.cli.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		x, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("delete points %s: %s", resp.Status, x)
+	}
+	return nil
+}
+
 // PlateSparse 把车牌号转成字符三元组稀疏向量，同一车牌总能得到同一向量。
 func PlateSparse(plate string) ([]uint32, []float32) {
 	r := []rune(plate)

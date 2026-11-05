@@ -59,6 +59,7 @@ func NewServer(cfg config.Config, st *store.Store) http.Handler {
 	s.mux.HandleFunc("GET /api/summary/list", auth.RequireAuth(s.handleSummaryList))
 
 	s.mux.HandleFunc("POST /api/admin/reset", auth.RequireAuth(s.handleAdminReset))
+	s.mux.HandleFunc("POST /api/events/batch-delete", auth.RequireAuth(s.handleDeleteEventsBatch))
 
 	web := http.FileServer(http.Dir(cfg.WebDir))
 	vendor := http.FileServer(http.Dir(filepath.Join(cfg.WebDir, "vendor")))
@@ -441,6 +442,28 @@ func (s *Server) handleCapture(w http.ResponseWriter, r *http.Request) {
 		"alert":      beep,
 		"alert_text": strings.Join(names, "、"),
 	})
+}
+
+// handleDeleteEventsBatch 批量删除事件。
+// POST /api/events/batch-delete {ids: ["uuid1", "uuid2"]}
+func (s *Server) handleDeleteEventsBatch(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		IDs []string `json:"ids"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
+		writeErr(w, 400, "参数解析失败")
+		return
+	}
+	if len(req.IDs) == 0 {
+		writeErr(w, 400, "ids 不能为空")
+		return
+	}
+	deleted, err := s.st.DeleteEvents(req.IDs)
+	if err != nil {
+		writeErr(w, 500, "删除失败: %v", err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "deleted": deleted})
 }
 
 func parseTime(v string, loc *time.Location) time.Time {

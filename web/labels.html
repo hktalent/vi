@@ -34,7 +34,15 @@
     </section>
 
     <section class="panel" style="margin-top: 16px;">
-      <h2>采集到的身份</h2>
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;">
+        <h2 style="margin:0;">采集到的身份</h2>
+        <div style="display:flex;gap:8px;align-items:center;">
+          <button class="btn small" id="btnSelectAll">全选</button>
+          <input class="input" id="batchLabel" placeholder="标签名" style="width:100px;display:none;" />
+          <button class="btn small primary" id="btnBatchLabel" style="display:none;">批量打标</button>
+          <button class="btn small danger" id="btnDelete" style="display:none;">删除选中</button>
+        </div>
+      </div>
       <div class="tabs">
         <button class="btn active" data-kind="face">人脸</button>
         <button class="btn" data-kind="plate">车牌</button>
@@ -45,6 +53,7 @@
       <div class="pager">
         <span id="pageInfo"></span>
         <button class="btn small" id="prev">上一页</button>
+        <span id="pageNumbers" style="display:inline-flex;gap:4px;align-items:center;"></span>
         <button class="btn small" id="next">下一页</button>
       </div>
     </section>

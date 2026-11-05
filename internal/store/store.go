@@ -384,6 +384,93 @@ func (s *Store) ExistingPersonIDs(prefix string) map[string]bool {
 	return out
 }
 
+// DeleteEvents 批量删除事件：从内存、events.jsonl、本地图片、Qdrant 中移除。
+// 返回删除的事件数量和错误（如果有）。
+func (s *Store) DeleteEvents(ids []string) (int, error) {
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	idSet := map[string]bool{}
+	for _, id := range ids {
+		idSet[id] = true
+	}
+
+	s.mu.Lock()
+	// 找出要删除的事件（收集图片路径用于后续删除文件）
+	var toDelete []*Event
+	var kept []*Event
+	for _, e := range s.events {
+		if idSet[e.ID] {
+			toDelete = append(toDelete, e)
+		} else {
+			kept = append(kept, e)
+		}
+	}
+	s.events = kept
+	s.mu.Unlock()
+
+	if len(toDelete) == 0 {
+		return 0, nil
+	}
+
+	// 重写 events.jsonl
+	if err := s.rewriteEventsFile(); err != nil {
+		log.Printf("[store] 重写 events.jsonl 失败: %v", err)
+	}
+
+	// 删除本地图片文件
+	for _, e := range toDelete {
+		if e.Image != "" {
+			imgPath := filepath.Join(s.cfg.DataDir, "images", e.Image)
+			if err := os.Remove(imgPath); err != nil && !os.IsNotExist(err) {
+				log.Printf("[store] 删除图片失败 %s: %v", imgPath, err)
+			}
+		}
+	}
+
+	// 从 Qdrant 删除 point（按 kind 分 collection）
+	faceIDs, plateIDs := []string{}, []string{}
+	for _, e := range toDelete {
+		if e.Kind == "plate" {
+			plateIDs = append(plateIDs, e.ID)
+		} else {
+			faceIDs = append(faceIDs, e.ID)
+		}
+	}
+	if len(faceIDs) > 0 {
+		if err := s.qd.DeletePoints("vi_faces", faceIDs); err != nil {
+			log.Printf("[qdrant] 删除人脸 point 失败: %v", err)
+		}
+	}
+	if len(plateIDs) > 0 {
+		if err := s.qd.DeletePoints("vi_plates", plateIDs); err != nil {
+			log.Printf("[qdrant] 删除车牌 point 失败: %v", err)
+		}
+	}
+
+	return len(toDelete), nil
+}
+
+// rewriteEventsFile 把当前内存中的事件重写回 events.jsonl（覆盖写）。
+func (s *Store) rewriteEventsFile() error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	path := filepath.Join(s.cfg.DataDir, "events.jsonl")
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	for _, e := range s.events {
+		b, err := json.Marshal(e)
+		if err != nil {
+			continue
+		}
+		f.Write(append(b, '\n'))
+	}
+	return nil
+}
+
 // normalizePlate 把车牌号规整为大写无空格（内部使用）。
 func normalizePlate(s string) string {
 	s = strings.ToUpper(strings.TrimSpace(s))
