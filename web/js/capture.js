@@ -509,17 +509,20 @@ document.getElementById('selCamera').addEventListener('change', async e => {
 });
 // 摄像头设备列表：iOS Safari 几个已知坑
 // 1. enumerateDevices 必须在有活跃 getUserMedia 流时才返回真实 label（授权前全是空字符串）
-// 2. devicechange 事件在 iOS Safari 上**根本不触发** — 只能手动调
-// 3. 刷新按钮/切换摄像头/页面可见时都重新枚举
+// 2. devicechange 事件在 iOS Safari 上**根本不触发**（旧 bug）
+// 3. addEventListener('devicechange', refreshCameras) 会把 Event 对象当 forceAuth 传入！
+//    Event 对象是 truthy → forceAuth=true → 循环触发 getUserMedia → **页面卡死崩溃**！
+//    必须用箭头函数包一层显式传 false
 if (navigator.mediaDevices && navigator.mediaDevices.addEventListener) {
-  navigator.mediaDevices.addEventListener('devicechange', refreshCameras);
+  navigator.mediaDevices.addEventListener('devicechange', () => refreshCameras(false));
 }
 // iOS Safari devicechange 不触发 → visibilitychange 兜底（切前后台回来重枚举）
 document.addEventListener('visibilitychange', () => {
-  if (!document.hidden) refreshCameras();
+  if (!document.hidden) refreshCameras(false);
 });
-// iOS Safari 前后摄像头切换后视频流恢复时再枚举一次
-video.addEventListener('play', () => setTimeout(refreshCameras, 500));
+// video.play 回调：传 false（只枚举，不触发权限请求）
+video.addEventListener('play', () => setTimeout(() => refreshCameras(false), 500));
+// 初始枚举：forceAuth=false（页面加载时没有用户手势，iOS 不允许触发权限请求）
 refreshCameras();
 
 // 运行状态栏：默认收起（手机优先），用户手动展开后记住选择
