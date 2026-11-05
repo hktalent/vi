@@ -20,4 +20,4 @@ if ! curl -s -m 2 http://127.0.0.1:6333/ > /dev/null 2>&1; then
 fi
 
 echo "vi: http://127.0.0.1:8688"
-exec ./bin/vi "$@"
+exec ./bin/vi serve "$@"

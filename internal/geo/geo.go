@@ -53,15 +53,23 @@ func WGS84ToGCJ02(lng, lat float64) (float64, float64) {
 	return lng + dLng, lat + dLat
 }
 
+// cachedAddr 是一条缓存记录：地址 + 写入时间 + 是否为"不好"的 fallback（纯经纬度字符串）
+type cachedAddr struct {
+	Addr string `json:"addr"`
+	At   int64  `json:"at"`   // Unix 秒
+	Bad  bool   `json:"bad"`  // true = 是 fallback 经纬度/空地址，有高德 key 时应强制刷新
+	Src  string `json:"src"`  // amap | openmeteo | fallback
+}
+
 // Geocoder 调用逆地理编码服务，把经纬度转换为中文地址，并做本地缓存。
 // 优先走高德（AMAP），国内坐标更准；没配 AMAP key 时回退 Open-Meteo。
 type Geocoder struct {
-	base    string // Open-Meteo 备用 URL
-	amapKey string // 高德 Web Service Key
+	base    string
+	amapKey string
 	cli     *http.Client
 	file    string
 	mu      sync.Mutex
-	cache   map[string]string
+	cache   map[string]cachedAddr
 	dirty   bool
 }
 
@@ -71,12 +79,49 @@ func NewGeocoder(base, amapKey, file string) *Geocoder {
 		amapKey: amapKey,
 		file:    file,
 		cli:     &http.Client{Timeout: 6 * time.Second},
-		cache:   map[string]string{},
+		cache:   map[string]cachedAddr{},
 	}
 	if b, err := os.ReadFile(file); err == nil {
-		json.Unmarshal(b, &g.cache)
+		// 兼容旧格式：map[string]string
+		var old map[string]string
+		if json.Unmarshal(b, &old) == nil && len(old) > 0 {
+			for k, v := range old {
+				g.cache[k] = cachedAddr{Addr: v, At: time.Now().Unix(), Bad: isFallbackAddr(v), Src: "legacy"}
+			}
+		} else {
+			json.Unmarshal(b, &g.cache)
+		}
+	}
+	if amapKey != "" {
+		log.Printf("[geo] 已配置高德 Key（%s…），共 %d 条缓存", amapKey[:min(8, len(amapKey))], len(g.cache))
+	} else {
+		log.Printf("[geo] 未配置高德 Key，使用 Open-Meteo 备用服务，共 %d 条缓存", len(g.cache))
 	}
 	return g
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// isFallbackAddr 判断地址是否是"不好"的 fallback（纯经纬度字符串如 "31.23456,121.45678"）
+func isFallbackAddr(s string) bool {
+	// 纯数字+逗号+小数点 → 是 fallback 经纬度
+	var hasDigit, hasComma, hasLetter bool
+	for _, r := range s {
+		switch {
+		case r >= '0' && r <= '9' || r == '.' || r == '-':
+			hasDigit = true
+		case r == ',':
+			hasComma = true
+		case (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || r > 0x80:
+			hasLetter = true
+		}
+	}
+	return hasDigit && hasComma && !hasLetter
 }
 
 func geoKey(lat, lon float64) string {
@@ -84,38 +129,57 @@ func geoKey(lat, lon float64) string {
 }
 
 // Reverse 返回地址；服务不可用时退化为经纬度字符串，保证采集不中断。
-// 入参 lat/lon 为 WGS-84（浏览器 GPS 原始坐标），内部自动按服务类型做坐标系转换。
 func (g *Geocoder) Reverse(lat, lon *float64) string {
 	if lat == nil || lon == nil {
 		return ""
 	}
 	key := geoKey(*lat, *lon)
+
+	// 缓存命中且不是 bad（经纬度 fallback）→ 直接返回
+	// 如果有高德 key 且缓存标记为 bad → 强制刷新（旧 Open-Meteo 结果换高德）
 	g.mu.Lock()
 	if v, ok := g.cache[key]; ok {
-		g.mu.Unlock()
-		return v
+		forceRefresh := v.Bad && g.amapKey != ""
+		if !forceRefresh {
+			g.mu.Unlock()
+			return v.Addr
+		}
+		log.Printf("[geo] 缓存是 fallback 经纬度，有高德 key，强制刷新: %s", key)
 	}
 	g.mu.Unlock()
 
-	addr := g.fetch(*lat, *lon)
-	if addr == "" {
+	addr, src := g.fetch(*lat, *lon)
+	bad := addr == "" || isFallbackAddr(addr)
+	if bad && addr == "" {
 		addr = fmt.Sprintf("%.5f,%.5f", *lat, *lon)
 	}
+
 	g.mu.Lock()
-	g.cache[key] = addr
+	g.cache[key] = cachedAddr{Addr: addr, At: time.Now().Unix(), Bad: bad, Src: src}
 	g.dirty = true
 	g.mu.Unlock()
 	g.flush()
+
+	latStr, lonStr := fmt.Sprintf("%.5f", *lat), fmt.Sprintf("%.5f", *lon)
+	if bad {
+		log.Printf("[geo] [%s] 逆地理编码返回 fallback: %s (%s, %s)", src, addr, latStr, lonStr)
+	} else {
+		log.Printf("[geo] [%s] %s ← (%s, %s)", src, addr, latStr, lonStr)
+	}
 	return addr
 }
 
-func (g *Geocoder) fetch(lat, lon float64) string {
+// fetch 返回 (地址, 来源标识)
+func (g *Geocoder) fetch(lat, lon float64) (string, string) {
 	if g.amapKey != "" {
-		if addr := g.fetchAmap(lat, lon); addr != "" {
-			return addr
+		if addr := g.fetchAmap(lat, lon); addr != "" && !isFallbackAddr(addr) {
+			return addr, "amap"
 		}
 	}
-	return g.fetchOpenMeteo(lat, lon)
+	if addr := g.fetchOpenMeteo(lat, lon); addr != "" {
+		return addr, "openmeteo"
+	}
+	return "", "fallback"
 }
 
 // fetchAmap 调用高德 Web Service 逆地理编码。
@@ -128,11 +192,12 @@ func (g *Geocoder) fetchAmap(wgsLat, wgsLon float64) string {
 	)
 	resp, err := g.cli.Get(url)
 	if err != nil {
-		log.Printf("[geo] 高德逆地理编码失败: %v", err)
+		log.Printf("[geo] 高德逆地理编码网络失败: %v", err)
 		return ""
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
+		log.Printf("[geo] 高德 HTTP %d", resp.StatusCode)
 		return ""
 	}
 	var d struct {
@@ -143,10 +208,11 @@ func (g *Geocoder) fetchAmap(wgsLat, wgsLon float64) string {
 		} `json:"regeocode"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&d); err != nil {
+		log.Printf("[geo] 高德响应解析失败: %v", err)
 		return ""
 	}
 	if d.Status != "1" {
-		log.Printf("[geo] 高德返回非成功状态: status=%s info=%s", d.Status, d.Info)
+		log.Printf("[geo] 高德返回非成功: status=%s info=%s", d.Status, d.Info)
 		return ""
 	}
 	return strings.TrimSpace(d.Regeocode.FormattedAddress)
