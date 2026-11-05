@@ -560,6 +560,127 @@ CMD ["vi", "-addr", "0.0.0.0:8688"]
 
 ---
 
+## 🌐 Cloudflare Tunnel 公网暴露（可选）
+
+vi 默认只监听 `127.0.0.1:8688`。要暴露到公网（尤其是手机端摄像头需要 HTTPS），推荐 **Cloudflare Tunnel**——一条出站隧道绕过运营商入站端口封锁，自带 HTTPS 证书。
+
+### 前提
+
+| 项目 | 要求 |
+|---|---|
+| Cloudflare 账号 | 域名 `51pwn.com` 已托管在 Cloudflare |
+| 已创建 Tunnel | `416d8666-6b3c-4232-8fde-a3995eabfa40`（一条隧道多条 ingress） |
+| cloudflared 二进制 | `brew install cloudflared` 或官方 release |
+
+### ingress 规则
+
+在 Cloudflare Tunnel 配置文件里追加一条（**不需要为 vi 开新隧道**，跟现有服务共用一条）：
+
+```yaml
+# ~/.cloudflared/config.yml（宿主机模式）
+# 或 51pwn-docker/cloudflared/config.yml（容器模式）
+
+tunnel: 416d8666-6b3c-4232-8fde-a3995eabfa40
+credentials-file: /etc/cloudflared/creds.json   # 容器里路径
+
+ingress:
+  # ↓ 新增：vi · 见到你
+  - hostname: vi.51pwn.com
+    service: http://127.0.0.1:8688       # 宿主机模式
+    # service: http://host.docker.internal:8688   # 容器模式（走 host-gateway）
+    originRequest:
+      connectTimeout: 30s
+      httpHostHeader: vi.51pwn.com
+  # ↓ 其他现有规则保持不变
+  - hostname: tv.51pwn.com
+    service: http://host.docker.internal:8080
+    ...
+  - service: http_status:404
+```
+
+### DNS 记录
+
+```bash
+# 一条命令：在 Cloudflare DNS 创建 CNAME → 隧道
+cloudflared tunnel route dns 416d8666-6b3c-4232-8fde-a3995eabfa40 vi.51pwn.com
+# → Added CNAME vi.51pwn.com which will route to this tunnel
+```
+
+cloudflared 会自动在 Cloudflare DNS 创建一条 `vi.51pwn.com CNAME -> cfargotunnel.com` 记录。
+
+### Cloudflare Tunnel 运行模式
+
+| 模式 | 适用场景 | 配置路径 | 热重载 |
+|---|---|---|---|
+| **容器模式**（推荐） | 跟其他服务一起用 docker compose 托管 | `51pwn-docker/cloudflared/config.yml` + `creds.json` | 改完要 `docker compose build cloudflared && up -d` |
+| **宿主机进程** | 调试或快速验证 | `~/.cloudflared/config.yml` + `416d...json` | `kill -HUP $(pgrep -f cloudflared)` |
+
+### 验证
+
+```bash
+# 本地回环
+curl http://127.0.0.1:8688/api/health
+# → {"ok":true,"qdrant":true,...}
+
+# 公网（Cloudflare Tunnel 已生效）
+curl -s https://vi.51pwn.com/api/health
+# → {"ok":true,"qdrant":true,"cooldown_seconds":60,...}
+```
+
+### 多服务共存（一条隧道，零冲突）
+
+一条 Cloudflare Tunnel 支持任意多条 ingress。ingress 按 **hostname 精确匹配** + 顺序兜底：
+
+```yaml
+ingress:
+  - hostname: vi.51pwn.com       # → 127.0.0.1:8688   (vi · 见到你)
+  - hostname: tv.51pwn.com       # → 127.0.0.1:8080   (ws-scrcpy)
+  - hostname: www.51pwn.com      # → nginx:80         (51pwn 平台)
+  - hostname: stock.51pwn.com    # → 127.0.0.1:3000   (strategy-web)
+  - hostname: chat.51pwn.com     # → 127.0.0.1:2083   (E2E_chat)
+  - service: http_status:404     # 兜底：其他 hostname 返回 404
+```
+
+**不会冲突**：每个 hostname 独立匹配，互不影响；尾部 `service: http_status:404` 是必须的 catch-all。
+
+### 与 startAllSs.sh 集成
+
+如果用 `startAllSs.sh` 管理全套服务，vi 已经被纳入：
+
+```bash
+cd goSqlite_gorm
+
+# 启动/自愈（vi 在 tmux 会话里自动拉起）
+sh startAllSs.sh start
+# → [startAllSs] vi 已在 tmux[vi] 运行（8688 + qdrant healthy）
+# → [startAllSs] 公网 vi.51pwn.com → http 200
+
+# 状态（vi 独立条目）
+sh startAllSs.sh status | grep vi
+# [vi tmux]                    session=vi window=0
+# [local 8688]                 http=200   http://127.0.0.1:8688
+# [public vi]                  http=200   https://vi.51pwn.com
+
+# 健康检查（vi + qdrant 双检查）
+sh startAllSs.sh check
+# → 本地 /api/health ok=true 且 qdrant=true 才算通过
+
+# 停止（调用 vi/stop.sh → tmux kill → pkill 兜底）
+sh startAllSs.sh stop
+```
+
+### 故障排查
+
+| 现象 | 可能原因 | 解决 |
+|---|---|---|
+| 公网 502 | vi 本地没活着 | `curl http://127.0.0.1:8688/api/health`；tmux 看进程 |
+| 容器模式 `credentials file not found` | config.yml 里的 `credentials-file` 路径在容器内不存在 | 确认 `docker cp creds.json ...` 或重建镜像时 `COPY` 进去 |
+| 容器模式 `host.docker.internal` 不可达 | 缺少 `extra_hosts` | docker-compose.yml 里 cloudflared 服务加 `extra_hosts: ["host.docker.internal:host-gateway"]` |
+| 公网 503 / 无连接 | tunnel 连接器全掉了 | `docker logs -f 51pwn-cloudflared` 看是否有 `Registered tunnel connection` |
+| 新加的 ingress 规则未生效 | config.yml 没 reload | 宿主机：`kill -HUP $(pgrep -f cloudflared)`；容器：重建镜像 |
+
+---
+
 ## ⚠️ 注意事项
 
 ### 浏览器要求

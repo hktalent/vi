@@ -9,9 +9,6 @@ on:
 permissions:
   contents: write     # 创建 Release + 上传 assets
 
-env:
-  QDRANT_VERSION: "1.12.4"
-
 jobs:
   # ─── 构建 vi Go 二进制（6 个目标交叉编译）───────────────────────────────────
   build:
@@ -25,35 +22,35 @@ jobs:
           - os: linux
             arch: amd64
             ext: ""
-            qdrant_asset: "qdrant-${{ env.QDRANT_VERSION }}-linux-x86_64.tar.gz"
-            qdrant_bin:   "qdrant-${{ env.QDRANT_VERSION }}-linux-x86_64/qdrant"
+            qdrant_asset: "qdrant-1.12.4-linux-x86_64.tar.gz"
+            qdrant_bin:   "qdrant-1.12.4-linux-x86_64/qdrant"
           - os: linux
             arch: arm64
             ext: ""
-            qdrant_asset: "qdrant-${{ env.QDRANT_VERSION }}-linux-aarch64.tar.gz"
-            qdrant_bin:   "qdrant-${{ env.QDRANT_VERSION }}-linux-aarch64/qdrant"
+            qdrant_asset: "qdrant-1.12.4-linux-aarch64.tar.gz"
+            qdrant_bin:   "qdrant-1.12.4-linux-aarch64/qdrant"
           # ── macOS ──
           - os: darwin
             arch: amd64
             ext: ""
-            qdrant_asset: "qdrant-${{ env.QDRANT_VERSION }}-macos-x86_64.tar.gz"
-            qdrant_bin:   "qdrant-${{ env.QDRANT_VERSION }}-macos-x86_64/qdrant"
+            qdrant_asset: "qdrant-1.12.4-macos-x86_64.tar.gz"
+            qdrant_bin:   "qdrant-1.12.4-macos-x86_64/qdrant"
           - os: darwin
             arch: arm64
             ext: ""
-            qdrant_asset: "qdrant-${{ env.QDRANT_VERSION }}-macos-aarch64.tar.gz"
-            qdrant_bin:   "qdrant-${{ env.QDRANT_VERSION }}-macos-aarch64/qdrant"
+            qdrant_asset: "qdrant-1.12.4-macos-aarch64.tar.gz"
+            qdrant_bin:   "qdrant-1.12.4-macos-aarch64/qdrant"
           # ── Windows ──
           - os: windows
             arch: amd64
             ext: ".exe"
-            qdrant_asset: "qdrant-${{ env.QDRANT_VERSION }}-windows-x86_64.zip"
-            qdrant_bin:   "qdrant-${{ env.QDRANT_VERSION }}-windows-x86_64/qdrant.exe"
+            qdrant_asset: "qdrant-1.12.4-windows-x86_64.zip"
+            qdrant_bin:   "qdrant-1.12.4-windows-x86_64/qdrant.exe"
           - os: windows
             arch: arm64
             ext: ".exe"
-            qdrant_asset: "qdrant-${{ env.QDRANT_VERSION }}-windows-aarch64.zip"
-            qdrant_bin:   "qdrant-${{ env.QDRANT_VERSION }}-windows-aarch64/qdrant.exe"
+            qdrant_asset: "qdrant-1.12.4-windows-aarch64.zip"
+            qdrant_bin:   "qdrant-1.12.4-windows-aarch64/qdrant.exe"
 
     steps:
       - name: Checkout
@@ -83,7 +80,7 @@ jobs:
       - name: Download bundled Qdrant
         run: |
           ASSET="${{ matrix.qdrant_asset }}"
-          QDRANT_URL="https://github.com/qdrant/qdrant/releases/download/v${{ env.QDRANT_VERSION }}/${ASSET}"
+          QDRANT_URL="https://github.com/qdrant/qdrant/releases/download/v1.12.4/${ASSET}"
           echo "下载 Qdrant: $QDRANT_URL"
           mkdir -p dist/bin
           cd dist/bin
