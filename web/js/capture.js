@@ -458,7 +458,7 @@ function refreshCamerasDebounced(forceAuth = false) {
 }
 
 async function refreshCameras(forceAuth = false) {
-  if (_rcInProgress) return;  // 防重入
+  if (_rcInProgress) return;
   _rcInProgress = true;
   try {
   const sel = document.getElementById('selCamera');
@@ -481,7 +481,7 @@ async function refreshCameras(forceAuth = false) {
       tmp = await navigator.mediaDevices.getUserMedia({
         video: { facingMode: { ideal: 'environment' } }, audio: false
       });
-      // iOS Safari: 等一个 macrotask 让 AVFoundation 完全初始化好再枚举
+      // iOS Safari: 等 AVFoundation 完全初始化好再枚举
       await new Promise(r => setTimeout(r, 200));
       list = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'videoinput');
     } catch (e) {
@@ -492,8 +492,8 @@ async function refreshCameras(forceAuth = false) {
       sel.innerHTML = '<option value="">' + msg + '</option>';
       return;
     } finally {
-      // iOS Safari: 延迟释放临时流 — stop 后立即枚举/DOM 操作会触发 devicechange 死循环
-      if (tmp) setTimeout(() => { tmp.getTracks().forEach(t => t.stop()); }, 500);
+      // 立即 stop！重入锁 + debounce 已经防死循环，延迟反而导致页面 reload 时旧定时器执行
+      if (tmp) tmp.getTracks().forEach(t => t.stop());
     }
   }
   if (!list.length) {
@@ -528,22 +528,38 @@ document.getElementById('selCamera').addEventListener('change', async e => {
     setTimeout(() => start(), 200);  // 再等 200ms 让 AVFoundation 彻底释放
   }
 });
-// 摄像头设备列表：iOS Safari 几个已知坑
-// 1. enumerateDevices 必须在有活跃 getUserMedia 流时才返回真实 label（授权前全是空字符串）
-// 2. devicechange 事件在 iOS Safari 上**根本不触发**（旧 bug）
-// 3. addEventListener('devicechange', refreshCameras) 会把 Event 对象当 forceAuth 传入！
-//    Event 对象是 truthy → forceAuth=true → 循环触发 getUserMedia → **页面卡死崩溃**！
-//    必须用箭头函数包一层显式传 false
-// 事件回调里全部用 debounced，防 iOS Safari 短时间多次 enumerateDevices 崩溃
-if (navigator.mediaDevices && navigator.mediaDevices.addEventListener) {
+// 事件回调：全部用 debounced + 首次屏蔽
+const _pageLoadedAt = Date.now();
+const _isIOS = /iP(hone|od|ad)/.test(navigator.platform);
+
+// devicechange: iOS Safari 已知 bug —— iOS 上根本不触发，直接不监听
+// 桌面端保留（Chrome/Edge/Firefox 正常）
+if (!_isIOS && navigator.mediaDevices && navigator.mediaDevices.addEventListener) {
   navigator.mediaDevices.addEventListener('devicechange', () => refreshCamerasDebounced(false));
 }
+
+// visibilitychange: iOS Safari reload 时旧页面 hidden + 新页面 visible 几乎同时触发
+// 加首次屏蔽：页面加载 2 秒内不响应，防 reload 过渡期间的混乱事件
 document.addEventListener('visibilitychange', () => {
-  if (!document.hidden) refreshCamerasDebounced(false);
+  if (Date.now() - _pageLoadedAt < 2000) return;  // 首次 2 秒屏蔽
+  if (document.hidden) return;
+  refreshCamerasDebounced(false);
 });
-// video.play 里的 setTimeout 也要用 debounced — 和 start() 里的调用可能只隔几百毫秒
-video.addEventListener('play', () => setTimeout(() => refreshCamerasDebounced(false), 500));
-// 初始枚举：forceAuth=false（页面加载时没有用户手势，iOS 不允许触发权限请求）
+
+// video.play: 只在页面加载后 3 秒才响应（防页面刚加载时 video.autoplay 触发）
+video.addEventListener('play', () => {
+  if (Date.now() - _pageLoadedAt < 3000) return;
+  setTimeout(() => refreshCamerasDebounced(false), 500);
+});
+
+// beforeunload: 立即清理所有 pending debounce 定时器 + 重入锁
+// 不让旧页面的定时器在新页面里执行
+window.addEventListener('beforeunload', () => {
+  if (_rcTimer) { clearTimeout(_rcTimer); _rcTimer = null; }
+  _rcInProgress = false;
+});
+
+// 初始枚举：forceAuth=false（页面加载时没有用户手势）
 refreshCameras();
 
 // 运行状态栏：默认收起（手机优先），用户手动展开后记住选择
