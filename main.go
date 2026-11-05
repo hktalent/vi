@@ -213,7 +213,18 @@ func runImportFaces(args []string) int {
 		}
 	}
 
-	imp, err := importface.NewImporter(cfg, qd, cascadePath, arcPath, *label, *dryRun)
+	// 创建 Store 实例（写 events.jsonl + Qdrant），让导入的人脸在前端可见
+	var st *store.Store
+	if !*dryRun {
+		g := geo.NewGeocoder("", "", filepath.Join(cfg.DataDir, "geo_cache.json"))
+		var err error
+		st, err = store.NewStore(cfg, qd, g)
+		if err != nil {
+			log.Printf("[warn] Store 初始化失败（导入的人脸不会出现在事件列表）: %v", err)
+		}
+	}
+
+	imp, err := importface.NewImporter(cfg, qd, st, cascadePath, arcPath, *label, *dryRun)
 	if err != nil {
 		log.Fatalf("初始化 Importer 失败: %v", err)
 	}
