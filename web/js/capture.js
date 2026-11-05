@@ -389,25 +389,22 @@ async function openCamera() {
 }
 
 // 温和停止：iOS Safari 上必须等 track 完全 stop 再 release stream，否则下一次 getUserMedia 会崩
-function stop() {
+async function stop() {
   state.running = false;
+  document.getElementById('btnStop').disabled = true;  // 立即锁按钮防连点
   const stream = video.srcObject;
   if (stream) {
     stream.getTracks().forEach(t => { t.enabled = false; t.stop(); });
-    // iOS Safari: 先等一个 macrotask 让 AVFoundation 释放
-    return new Promise(resolve => setTimeout(() => {
-      video.srcObject = null;
-      ctx.clearRect(0, 0, overlay.width, overlay.height);
-      resolve();
-    }, 100));
+    // iOS Safari: 等一个 macrotask 让 AVFoundation 释放
+    await new Promise(resolve => setTimeout(resolve, 100));
   }
   video.srcObject = null;
   ctx.clearRect(0, 0, overlay.width, overlay.height);
   document.getElementById('emptyTip').style.display = 'grid';
   setChip('chipCamera', null, '摄像头已停止');
   document.getElementById('btnStart').disabled = false;
-  document.getElementById('btnStop').disabled = true;
   setLive('已停止');
+  if (geoState.watchId !== null) { geoState.stop(); }
 }
 
 function onGeo(g) {
@@ -435,7 +432,7 @@ async function health() {
 }
 
 document.getElementById('btnStart').addEventListener('click', start);
-document.getElementById('btnStop').addEventListener('click', stop);
+document.getElementById('btnStop').addEventListener('click', () => stop());
 document.getElementById('btnBeep').addEventListener('click', () => beeper.beep(2));
 
 // 摄像头设备列表：授权前只能拿到占位名，授权后刷新才能显示真实名称
