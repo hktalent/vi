@@ -194,3 +194,205 @@ func clamp(v float32, lo, hi float32) float32 {
 	}
 	return v
 }
+
+// FaceChecker 封装 YuNet 检测器 + Haar eye cascade，对图片做人脸检测 + 完整五官质量验证。
+// 两条路径（图片导入 / Web 采集）统一复用它的 Detect + CheckQuality。
+//
+// YuNet 输出 5 个点：右眼中心、左眼中心、鼻尖、右嘴角、左嘴角
+// 通过 CheckQuality 的条件（10 项全过才算完整五官）：
+//   A. YuNet Score ≥ 0.75
+//   B. 双眼水平距离 / 脸宽 ∈ [12%, 55%]
+//   C. 双眼垂直倾斜 / 脸高 ≤ 30%
+//   D. 鼻尖 x ∈ 双眼区间 ± 20%
+//   E. MAR（嘴巴张合度）∈ [0.05, 0.45]
+//   F. 嘴巴水平宽度 ≥ 12% 脸宽
+//   G. 嘴巴中心 y ∈ [鼻尖+5%, 鼻尖+40%] faceH
+//   H. 所有 5 个 landmark 在脸 bbox ±5% 内
+//   I. 双眼 landmark 附近 Haar eye cascade 必须能检测到（闭眼拦截）
+//   J. YuNet bbox 左右各留 ≥ 15% faceW 的耳朵空间（侧脸耳朵被裁 → 过不了）
+type FaceChecker struct {
+	yunet      *YuNetDetector
+	eyeCascade *gocv.CascadeClassifier // eye_tree_eyeglasses 或 eye.xml
+}
+
+// NewFaceChecker 加载 YuNet 模型 + Haar eye cascade，构造 FaceChecker。
+// yunetPath 为空或加载失败 → 返回 (nil, nil)（调用方可用 nil 判断是否可用）。
+// cascadeDir 是 OpenCV Haar cascades 所在目录。
+func NewFaceChecker(yunetPath, cascadeDir string) (*FaceChecker, error) {
+	fc := &FaceChecker{}
+	if yunetPath != "" {
+		yd, err := NewYuNetDetector(yunetPath)
+		if err != nil {
+			log.Printf("[facecheck] ⚠️ YuNet 加载失败: %v，跳过人脸质量验证", err)
+			return nil, nil
+		}
+		fc.yunet = yd
+		log.Printf("[facecheck] YuNet 加载成功: %s", yunetPath)
+	} else {
+		return nil, nil
+	}
+
+	if cascadeDir != "" {
+		eyeXML := filepath.Join(cascadeDir, "haarcascade_eye_tree_eyeglasses.xml")
+		if _, err := os.Stat(eyeXML); err != nil {
+			eyeXML = filepath.Join(cascadeDir, "haarcascade_eye.xml")
+		}
+		if _, err := os.Stat(eyeXML); err == nil {
+			ec := gocv.NewCascadeClassifier()
+			if ec.Load(eyeXML) {
+				fc.eyeCascade = &ec
+				log.Printf("[facecheck] Haar eye cascade 加载成功: %s", filepath.Base(eyeXML))
+			} else {
+				ec.Close()
+				log.Printf("[facecheck] ⚠️ eye cascade 加载失败，闭眼拦截降级为 YuNet score 检查")
+			}
+		}
+	}
+
+	return fc, nil
+}
+
+// Close 释放 YuNet 模型资源。
+func (fc *FaceChecker) Close() {
+	if fc.yunet != nil {
+		fc.yunet.Close()
+	}
+	if fc.eyeCascade != nil {
+		fc.eyeCascade.Close()
+	}
+}
+
+// Detect 检测图片中所有人脸（直接代理 YuNetDetector.Detect）。
+func (fc *FaceChecker) Detect(img gocv.Mat) []YuFace {
+	if fc.yunet == nil {
+		return nil
+	}
+	return fc.yunet.Detect(img)
+}
+
+// CheckQuality 验证 YuNet 检测到的一张脸是否完整五官（10 项全过）。
+// 返回 true = 完整五官、位置合理、睁眼、正脸。
+func (fc *FaceChecker) CheckQuality(f YuFace, img gocv.Mat) bool {
+	faceW := float32(f.Rect.Dx())
+	faceH := float32(f.Rect.Dy())
+	bboxLeft := float32(f.Rect.Min.X)
+	bboxRight := float32(f.Rect.Max.X)
+
+	// A. YuNet score 门槛
+	if f.Score < 0.75 {
+		return false
+	}
+
+	lm := f.Landmarks
+	for k := 0; k < 5; k++ {
+		x, y := lm[k][0], lm[k][1]
+		if x != x || y != y { // NaN
+			return false
+		}
+		if x < -5 || y < -5 || x > float32(img.Cols()+5) || y > float32(img.Rows()+5) {
+			return false
+		}
+	}
+	if faceW < 30 || faceH < 30 {
+		return false
+	}
+
+	rightEye := lm[0]
+	leftEye := lm[1]
+	nose := lm[2]
+	rightMouth := lm[3]
+	leftMouth := lm[4]
+
+	// B. 双眼水平距离 ∈ [12%, 55%] faceW
+	eyeDx := absF32(leftEye[0] - rightEye[0])
+	eyeDxRatio := eyeDx / faceW
+	if eyeDxRatio < 0.12 || eyeDxRatio > 0.55 {
+		return false
+	}
+
+	// C. 双眼垂直倾斜
+	eyeDy := absF32(leftEye[1] - rightEye[1])
+	if eyeDy/faceH > 0.30 {
+		return false
+	}
+
+	// D. 鼻尖在双眼之间
+	eyeMinX := minF32(leftEye[0], rightEye[0])
+	eyeMaxX := maxF32(leftEye[0], rightEye[0])
+	if nose[0] < eyeMinX-eyeDx*0.2 || nose[0] > eyeMaxX+eyeDx*0.2 {
+		return false
+	}
+
+	// E. MAR（嘴巴张合度）
+	mouthW := absF32(leftMouth[0] - rightMouth[0])
+	mouthH := absF32(leftMouth[1] - rightMouth[1])
+	if mouthW < 1 {
+		return false
+	}
+	mar := mouthH / mouthW
+	if mar < 0.05 || mar > 0.45 {
+		return false
+	}
+
+	// F. 嘴巴水平宽度 ≥ 12% 脸宽
+	if mouthW/faceW < 0.12 {
+		return false
+	}
+
+	// G. 嘴巴中心严格在鼻尖下方 5-40% faceH
+	mouthAvgY := (rightMouth[1] + leftMouth[1]) / 2
+	offset := mouthAvgY - nose[1]
+	if offset/faceH < 0.05 || offset/faceH > 0.40 {
+		return false
+	}
+
+	// H. 所有 landmark 在 face bbox ±5% 内
+	xb := bboxLeft - faceW*0.05
+	x2b := bboxRight + faceW*0.05
+	yb := float32(f.Rect.Min.Y) - faceH*0.05
+	y2b := float32(f.Rect.Max.Y) + faceH*0.05
+	for k := 0; k < 5; k++ {
+		if lm[k][0] < xb || lm[k][0] > x2b || lm[k][1] < yb || lm[k][1] > y2b {
+			return false
+		}
+	}
+
+	// I. 闭眼拦截：双眼 landmark 附近 Haar eye cascade 必须能检测到
+	if fc.eyeCascade != nil {
+		if !fc.eyeOpenNear(img, rightEye[0], rightEye[1], faceW, faceH) ||
+			!fc.eyeOpenNear(img, leftEye[0], leftEye[1], faceW, faceH) {
+			return false
+		}
+	}
+
+	// J. 耳朵空间：YuNet bbox 左右各留 ≥ 15% faceW 给耳朵（侧脸耳朵被裁 → bbox 紧贴眼角 → 过不了）
+	minEarSpace := faceW * 0.15
+	rightEarSpace := rightEye[0] - bboxLeft
+	leftEarSpace := bboxRight - leftEye[0]
+	if rightEarSpace < minEarSpace || leftEarSpace < minEarSpace {
+		return false
+	}
+
+	return true
+}
+
+// eyeOpenNear 检查 img 中 (cx, cy) 附近是否有一只睁开的眼睛。
+// 闭眼时眼皮缝高度只有 2-3px，minSize=8×5 挡不住 → cascade 检不出。
+func (fc *FaceChecker) eyeOpenNear(img gocv.Mat, cx, cy, faceW, faceH float32) bool {
+	w := int(maxF32(faceW*0.22, 14))
+	h := int(maxF32(faceH*0.14, 9))
+	x1 := max(0, int(cx)-w/2)
+	y1 := max(0, int(cy)-h/2)
+	x2 := min(img.Cols(), x1+w)
+	y2 := min(img.Rows(), y1+h)
+	if x2-x1 < 10 || y2-y1 < 6 {
+		return false
+	}
+	patch := img.Region(image.Rect(x1, y1, x2, y2))
+	defer patch.Close()
+	gray := gocv.NewMat()
+	defer gray.Close()
+	gocv.CvtColor(patch, &gray, gocv.ColorBGRToGray)
+	rects := fc.eyeCascade.DetectMultiScaleWithParams(gray, 1.05, 5, 0, image.Pt(8, 5), image.Pt(0, 0))
+	return len(rects) > 0
+}

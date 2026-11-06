@@ -15,20 +15,24 @@ import (
 
 	"vi/internal/auth"
 	"vi/internal/config"
+	"vi/internal/importface"
 	"vi/internal/report"
 	"vi/internal/store"
+
+	"gocv.io/x/gocv"
 )
 
 // Server 是所有 HTTP 路由的入口。
 type Server struct {
 	cfg config.Config
 	st  *store.Store
+	fc  *importface.FaceChecker // YuNet + Haar eye cascade，Web 采集时做完整五官验证（nil=不可用，跳过验证）
 	mux *http.ServeMux
 }
 
 // NewServer 组装所有路由并返回一个 http.Handler。
-func NewServer(cfg config.Config, st *store.Store) http.Handler {
-	s := &Server{cfg: cfg, st: st, mux: http.NewServeMux()}
+func NewServer(cfg config.Config, st *store.Store, fc *importface.FaceChecker) http.Handler {
+	s := &Server{cfg: cfg, st: st, fc: fc, mux: http.NewServeMux()}
 
 	// —— 公开接口（免登录）——
 	s.mux.HandleFunc("POST /api/login", s.handleLogin)
@@ -426,6 +430,17 @@ func (s *Server) handleCapture(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// ✅ 【Web 采集完整五官验证】YuNet 5 点 landmark + Haar eye cascade 双重验证
+	//   —— 和图片导入路径的 isQualityFace 完全统一（10 项条件全过才收）
+	//   —— 验证失败 → 400 拒，连图都不存
+	//   —— FaceChecker 为 nil（YuNet 模型没加载）→ 跳过（降级为 L2 norm 兜底）
+	if kind == "face" && len(vec) == 512 && s.fc != nil {
+		ok := s.verifyFaceQuality(imgBytes, w)
+		if !ok {
+			return
+		}
+	}
+
 	// 预解析 personID → SaveImage 用确定性文件名（同 person + 同天 = 同文件，避免重复存图）
 	var personID string
 	if kind == "face" && len(vec) > 0 {
@@ -481,6 +496,37 @@ func (s *Server) handleCapture(w http.ResponseWriter, r *http.Request) {
 		"alert":      beep,
 		"alert_text": strings.Join(names, "、"),
 	})
+}
+
+// verifyFaceQuality 对 Web 上传的人脸 crop 做 YuNet + 完整五官验证。
+// 解码 JPEG/PNG → YuNet.Detect → CheckQuality（10 项条件全过才收）。
+// 返回 false = 验证失败已写响应；true = 通过，调用方继续处理。
+func (s *Server) verifyFaceQuality(imgBytes []byte, w http.ResponseWriter) bool {
+	img, err := gocv.IMDecode(imgBytes, gocv.IMReadColor)
+	if err != nil || img.Empty() {
+		writeErr(w, 400, "人脸图片解码失败")
+		return false
+	}
+	defer img.Close()
+
+	faces := s.fc.Detect(img)
+	if len(faces) == 0 {
+		writeErr(w, 400, "YuNet 未检测到人脸（不是有效人脸 crop）")
+		return false
+	}
+
+	var bestFace *importface.YuFace
+	for i := range faces {
+		if s.fc.CheckQuality(faces[i], img) {
+			bestFace = &faces[i]
+			break
+		}
+	}
+	if bestFace == nil {
+		writeErr(w, 400, "人脸五官不完整：闭眼 / 侧脸 / 五官位置异常 / 耳朵被裁")
+		return false
+	}
+	return true
 }
 
 // handleDeleteEventsBatch 批量删除事件。

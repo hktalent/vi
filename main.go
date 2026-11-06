@@ -153,7 +153,21 @@ func runServe() int {
 		log.Fatalf("加载媒体签名密钥失败: %v", err)
 	}
 
-	srv := api.NewServer(cfg, st)
+	// ✅ FaceChecker：YuNet 5 点 landmark + Haar eye cascade → Web 采集时做完整五官验证
+	//   和图片导入路径的 isQualityFace 完全统一
+	yunetPath := filepath.Join(cfg.ModelsDir, "face_detection_yunet_2023mar.onnx")
+	cascadePath := findHaarCascade()
+	cascadeDir := filepath.Dir(cascadePath)
+	fc, err := importface.NewFaceChecker(yunetPath, cascadeDir)
+	if err != nil {
+		log.Printf("[warn] FaceChecker 初始化失败（Web 人脸质量验证降级为 L2 norm）: %v", err)
+	} else if fc != nil {
+		log.Printf("✅ FaceChecker 就绪：YuNet + Haar eye cascade（Web 采集将做完整五官验证）")
+	} else {
+		log.Printf("[info] %s 不存在，Web 人脸质量验证降级为 L2 norm 检查", yunetPath)
+	}
+
+	srv := api.NewServer(cfg, st, fc)
 	log.Printf("vi 已启动: http://%s  (人脸阈值 %.2f, 冷却 %s)", cfg.Addr, cfg.FaceThresh, cfg.Cooldown)
 	if err := http.ListenAndServe(cfg.Addr, srv); err != nil {
 		log.Fatal(err)

@@ -256,7 +256,11 @@ cd vi/
 ```bash
 # 扫描 ~/Photos/婚礼 目录递归所有照片
 # 自动：检测人脸 → 提 ArcFace 特征 → 解析 EXIF GPS/海拔/方向/时间 → 逆地理得中文地址 → 入库
-./impt.sh ~/Photos/婚礼 "婚礼"
+./impt.sh "/Users/${USER}/Documents/M_T_X/婚礼" "婚纱"
+./impt.sh "/Volumes/Home/MyPhoto/0205婚礼摄影" "婚礼现场"
+./impt.sh "/Volumes/Home/MyPhoto" "婚礼宾客"
+
+
 # 等价于：./bin/vi importfaces -dir ~/Photos/婚礼 -label 婚礼
 
 # dry-run：只扫描+检测，不上传 Qdrant
