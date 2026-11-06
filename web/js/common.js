@@ -222,6 +222,7 @@ const geoState = {
   lon: null,
   altitude: null,  // 海拔（米），GPS 提供
   heading: null,   // 相机方向角度（0=北, 90=东），来自 DeviceOrientationEvent
+  speed: null,     // 水平速度（m/s），来自 Geolocation API；null = 无数据或静止
   accuracy: null,
   watchId: null,
   timer: null,
@@ -235,10 +236,11 @@ const geoState = {
       geoState.lon = pos.coords.longitude;
       geoState.accuracy = pos.coords.accuracy;
       geoState.altitude = pos.coords.altitude;  // GPS 海拔（可能为 null）
+      geoState.speed = pos.coords.speed;        // 水平速度（m/s，null = 静止/无数据）
       if (onChange) onChange({
         lat: geoState.lat, lon: geoState.lon,
         altitude: geoState.altitude, accuracy: geoState.accuracy,
-        heading: geoState.heading,
+        heading: geoState.heading, speed: geoState.speed,
       });
     };
     const fail = err => {

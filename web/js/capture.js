@@ -486,13 +486,20 @@ async function refreshStageGeoHud() {
   const g = geoState;
   if (g.lat == null) { el.textContent = '等待定位...'; return; }
 
-  // 方向 + 海拔（实时，传感器变化就更新）
+  // 速度（gps 自带 m/s）：≥ 4 m/s 视为车载/骑行 → km/h，否则步行 → m/s
   const extras = [];
-  if (g.heading != null && !isNaN(g.heading)) {
-    extras.push(`方向 ${headingToDirection(g.heading)}`);
+  if (g.speed != null && !isNaN(g.speed) && g.speed > 0.2) {
+    if (g.speed >= 4) {
+      extras.push(`${(g.speed * 3.6).toFixed(1)} km/h`);     // 车载/骑行
+    } else {
+      extras.push(`${g.speed.toFixed(1)} m/s`);              // 步行/跑步
+    }
   }
   if (g.altitude != null && !isNaN(g.altitude)) {
     extras.push(`海拔 ${Math.round(g.altitude)}m`);
+  }
+  if (g.heading != null && !isNaN(g.heading)) {
+    extras.push(`方向 ${headingToDirection(g.heading)}`);
   }
 
   // 判断是否需要重新逆地理（位移超阈值 / 首次）

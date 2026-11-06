@@ -122,6 +122,7 @@ jobs:
 
       # vendor/ 已提交且内含 stub 化 gocv（videoio.cpp），go build 默认 -mod=vendor 直接使用，
       # 无需也不能再跑 patch-gocv.sh（会改 go.mod 导致 inconsistent vendoring）
+      # importface 包已整合进 main，不再需要 -tags importface
       - name: Build vi
         env:
           CGO_ENABLED: "1"
@@ -129,7 +130,7 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
         run: |
           mkdir -p dist/bin
-          go build -tags importface -trimpath -ldflags "-s -w -X main.Version=${{ github.ref_name }}" -o dist/bin/vi${{ matrix.os == 'windows' && '.exe' || '' }} .
+          go build -trimpath -ldflags "-s -w -X main.Version=${{ github.ref_name }}" -o dist/bin/vi${{ matrix.os == 'windows' && '.exe' || '' }} .
 
       - name: Bundle OpenCV DLLs (Windows)
         if: matrix.os == 'windows'
@@ -176,22 +177,31 @@ jobs:
           PKG="vi-${{ github.ref_name }}-${{ matrix.os }}-${{ matrix.arch }}"
           echo "PKG=$PKG" >> "$GITHUB_ENV"
           mkdir -p "dist/$PKG"
-          cp -r web statics config.example.yaml README.md dist/bin "dist/$PKG/"
-          cp -r scripts "dist/$PKG/" 2>/dev/null || true
+          # 核心：前端 + 二进制 + 文档（全部 git-tracked，必然存在）
+          cp -r web dist/bin README.md "dist/$PKG/"
+          # 脚本（有就包，没就跳过，防止 set -e 误杀）
+          for f in start.sh stop.sh impt.sh scripts; do
+            if [ -e "$f" ]; then cp -r "$f" "dist/$PKG/"; fi
+          done
+          # scripts/package.sh 是内部脚本，不对外
+          rm -f "dist/$PKG/scripts/package.sh" 2>/dev/null || true
+
+          # —— 后端 importfaces 子命令需要的模型（小体积 ≈ 1.5MB，直接进平台包）——
           mkdir -p "dist/$PKG/models/haarcascades"
           base="https://raw.githubusercontent.com/opencv/opencv/4.10.0/data/haarcascades"
-          for f in haarcascade_frontalface_default.xml haarcascade_frontalface_alt.xml haarcascade_frontalface_alt2.xml haarcascade_eye.xml haarcascade_smile.xml; do
+          for f in haarcascade_frontalface_default.xml haarcascade_frontalface_alt.xml \
+                   haarcascade_frontalface_alt2.xml haarcascade_eye.xml haarcascade_smile.xml; do
             curl -fsSL "$base/$f" -o "dist/$PKG/models/haarcascades/$f"
           done
-          # YuNet DNN 人脸检测模型：优先用 git 内置副本，缺失则从 opencv_zoo 下载兜底
+          # YuNet DNN 人脸检测模型：优先用源码内置副本，缺失则从 opencv_zoo 下载
           if [ -f models/face_detection_yunet_2023mar.onnx ]; then
             cp models/face_detection_yunet_2023mar.onnx "dist/$PKG/models/"
           else
             curl -fsSL "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx" \
               -o "dist/$PKG/models/face_detection_yunet_2023mar.onnx"
           fi
-          if [ -f start.sh ]; then cp start.sh "dist/$PKG/"; fi
-          rm -f "dist/$PKG/scripts/package.sh"
+          # front.onnx 和前端用的大模型（arc.onnx 等 ~400MB）由 models job 单独打 face-models.tar.gz，
+          # 用户需要先解压到 models/ 再启动 vi（README 里已说明）
 
       - name: Archive package
         shell: bash
