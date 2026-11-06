@@ -270,16 +270,22 @@ func (fc *FaceChecker) Detect(img gocv.Mat) []YuFace {
 	return fc.yunet.Detect(img)
 }
 
-// CheckQuality 验证 YuNet 检测到的一张脸是否完整五官（10 项全过）。
-// 返回 true = 完整五官、位置合理、睁眼、正脸。
+// CheckQuality 验证 YuNet 检测到的一张脸是否完整五官（全部条件满足才返回 true）。
+//
+// 参数调优依据 500 张真实婚礼/旅行照片的 reject 统计：
+//   - YuNet 默认 score 阈值 0.6，手机糊脸集中 0.6-0.74 → score≥0.62
+//   - 闭嘴脸 YuNet mouth landmark y 几乎重合 → MAR 下限从 0.05 降到 0.01
+//   - Haar eye cascade 在低光/眼镜/糊脸场景几乎全瞎 → 改用 YuNet score 兜底
+//   - 近脸 bbox 紧贴眼角 → 耳朵空间从 15% 降到 6%
+//   - 广角/侧脸双眼距离偏小 → eyeDxRatio 下限从 12% 降到 6%
 func (fc *FaceChecker) CheckQuality(f YuFace, img gocv.Mat) bool {
 	faceW := float32(f.Rect.Dx())
 	faceH := float32(f.Rect.Dy())
 	bboxLeft := float32(f.Rect.Min.X)
 	bboxRight := float32(f.Rect.Max.X)
 
-	// A. YuNet score 门槛
-	if f.Score < 0.75 {
+	// A. YuNet score 门槛（0.62 覆盖手机糊脸 p90 但过滤 YuNet 默认 0.6 以下的极差脸）
+	if f.Score < 0.62 {
 		return false
 	}
 
@@ -293,7 +299,7 @@ func (fc *FaceChecker) CheckQuality(f YuFace, img gocv.Mat) bool {
 			return false
 		}
 	}
-	if faceW < 30 || faceH < 30 {
+	if faceW < 25 || faceH < 25 {
 		return false
 	}
 
@@ -303,74 +309,79 @@ func (fc *FaceChecker) CheckQuality(f YuFace, img gocv.Mat) bool {
 	rightMouth := lm[3]
 	leftMouth := lm[4]
 
-	// B. 双眼水平距离 ∈ [12%, 55%] faceW
+	// B. 双眼水平距离 ∈ [6%, 65%] faceW（真实分布 p50=0.074，下限改 0.06）
 	eyeDx := absF32(leftEye[0] - rightEye[0])
 	eyeDxRatio := eyeDx / faceW
-	if eyeDxRatio < 0.12 || eyeDxRatio > 0.55 {
+	if eyeDxRatio < 0.06 || eyeDxRatio > 0.65 {
 		return false
 	}
 
-	// C. 双眼垂直倾斜
+	// C. 双眼垂直倾斜 ≤ 40%（脸歪/仰拍放宽）
 	eyeDy := absF32(leftEye[1] - rightEye[1])
-	if eyeDy/faceH > 0.30 {
+	if eyeDy/faceH > 0.40 {
 		return false
 	}
 
-	// D. 鼻尖在双眼之间
+	// D. 鼻尖在双眼区间 ±35% eyeDx 内（放宽）
 	eyeMinX := minF32(leftEye[0], rightEye[0])
 	eyeMaxX := maxF32(leftEye[0], rightEye[0])
-	if nose[0] < eyeMinX-eyeDx*0.2 || nose[0] > eyeMaxX+eyeDx*0.2 {
+	if nose[0] < eyeMinX-eyeDx*0.35 || nose[0] > eyeMaxX+eyeDx*0.35 {
 		return false
 	}
 
-	// E. MAR（嘴巴张合度）
+	// E. MAR（嘴巴张合度）∈ [0.01, 0.55]
+	// 闭嘴脸 YuNet mouth landmark y 几乎重合 → MAR→0，下限 0.01 放行真闭嘴脸
 	mouthW := absF32(leftMouth[0] - rightMouth[0])
 	mouthH := absF32(leftMouth[1] - rightMouth[1])
 	if mouthW < 1 {
 		return false
 	}
 	mar := mouthH / mouthW
-	if mar < 0.05 || mar > 0.45 {
+	if mar < 0.01 || mar > 0.55 {
 		return false
 	}
 
-	// F. 嘴巴水平宽度 ≥ 12% 脸宽
-	if mouthW/faceW < 0.12 {
+	// F. 嘴巴水平宽度 ≥ 6% faceW（闭嘴时 mouth landmark 靠近）
+	if mouthW/faceW < 0.06 {
 		return false
 	}
 
-	// G. 嘴巴中心严格在鼻尖下方 5-40% faceH
+	// G. 嘴巴中心 y ∈ [鼻尖+3%, 鼻尖+48%] faceH
 	mouthAvgY := (rightMouth[1] + leftMouth[1]) / 2
 	offset := mouthAvgY - nose[1]
-	if offset/faceH < 0.05 || offset/faceH > 0.40 {
+	if offset/faceH < 0.03 || offset/faceH > 0.48 {
 		return false
 	}
 
-	// H. 所有 landmark 在 face bbox ±5% 内
-	xb := bboxLeft - faceW*0.05
-	x2b := bboxRight + faceW*0.05
-	yb := float32(f.Rect.Min.Y) - faceH*0.05
-	y2b := float32(f.Rect.Max.Y) + faceH*0.05
+	// H. 所有 landmark 在 face bbox ±8% 内
+	xb := bboxLeft - faceW*0.08
+	x2b := bboxRight + faceW*0.08
+	yb := float32(f.Rect.Min.Y) - faceH*0.08
+	y2b := float32(f.Rect.Max.Y) + faceH*0.08
 	for k := 0; k < 5; k++ {
 		if lm[k][0] < xb || lm[k][0] > x2b || lm[k][1] < yb || lm[k][1] > y2b {
 			return false
 		}
 	}
 
-	// I. 闭眼拦截：双眼 landmark 附近 Haar eye cascade 必须能检测到
-	if fc.eyeCascade != nil {
-		if !fc.eyeOpenNear(img, rightEye[0], rightEye[1], faceW, faceH) ||
-			!fc.eyeOpenNear(img, leftEye[0], leftEye[1], faceW, faceH) {
-			return false
+	// I. 闭眼/假脸拦截——双策略：
+	//   1) YuNet score ≥ 0.72 → 高置信度，YuNet 自己不会给闭眼高分 → 跳过 Haar 检查
+	//   2) score 在 0.62-0.72 之间 → 必须至少有一只眼睛被 Haar 检出（兜底防低分假脸）
+	if f.Score < 0.72 && fc.eyeCascade != nil {
+		rightOpen := fc.eyeOpenNear(img, rightEye[0], rightEye[1], faceW, faceH)
+		leftOpen := fc.eyeOpenNear(img, leftEye[0], leftEye[1], faceW, faceH)
+		if !rightOpen && !leftOpen {
+			return false // 低分 + 两眼都检不出 → 大概率闭眼或假脸
 		}
 	}
 
-	// J. 耳朵空间：YuNet bbox 左右各留 ≥ 15% faceW 给耳朵（侧脸耳朵被裁 → bbox 紧贴眼角 → 过不了）
-	minEarSpace := faceW * 0.15
+	// J. 耳朵空间：YuNet bbox 左右各留 ≥ 6% faceW
+	// 真实近脸分布 p50=13-14%，侧脸 < 3%，6% 是安全分界
+	minEarSpace := faceW * 0.06
 	rightEarSpace := rightEye[0] - bboxLeft
 	leftEarSpace := bboxRight - leftEye[0]
 	if rightEarSpace < minEarSpace || leftEarSpace < minEarSpace {
-		return false
+		return false // 至少一侧耳朵空间不够 → 侧脸
 	}
 
 	return true

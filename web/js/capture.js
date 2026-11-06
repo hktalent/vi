@@ -115,6 +115,12 @@ function formData(kind, capturedAt) {
   if (geoState.heading != null && !isNaN(geoState.heading)) {
     fd.append('heading', String(geoState.heading));
   }
+  // 主界面"输入名字"框：自动采集到人脸时把名字一起提交，后端自动打标签（留空则不打）
+  if (kind === 'face') {
+    const el = document.getElementById('captureName');
+    const name = el ? el.value.trim() : '';
+    if (name) fd.append('label_name', name);
+  }
   return fd;
 }
 

@@ -17,6 +17,7 @@ import (
 
 	"vi/internal/config"
 	"vi/internal/exif"
+	"vi/internal/imgenh"
 	"vi/internal/qdrant"
 	"vi/internal/store"
 )
@@ -42,6 +43,7 @@ type Importer struct {
 	seen        []seenFace        // 本次 Run 内已见过的人脸向量+personID（批次内同人去重）
 	skipped     int               // 跳过数量统计
 	filtered    int               // 被 norm / 侧脸 / 五官不全过滤丢弃的数量统计
+	enh         *imgenh.Enhancer  // 异步高清增强（nil=不增强）
 }
 
 // seenFace 批次内已见过的一张脸，用于 Run 循环中的同人去重。
@@ -87,7 +89,7 @@ func (im *Importer) matchBatch(vec []float32) (string, float64) {
 // yunetPath 是 YuNet 检测模型路径（face_detection_yunet_2023mar.onnx），存在时优先于 Haar cascade。
 // cascadeXML 是 OpenCV Haar cascade 路径（YuNet 缺失时的回退检测器），arcOnnx 是 arc.onnx 路径（提取 embedding 用）。
 // force=true 时忽略已有导入记录，全部重新导入。
-func NewImporter(cfg config.Config, qd *qdrant.Qdrant, st *store.Store, cascadeXML, arcOnnx, yunetPath, label string, dryRun, force bool) (*Importer, error) {
+func NewImporter(cfg config.Config, qd *qdrant.Qdrant, st *store.Store, cascadeXML, arcOnnx, yunetPath, label string, dryRun, force bool, enh *imgenh.Enhancer) (*Importer, error) {
 	im := &Importer{
 		cfg:         cfg,
 		qd:          qd,
@@ -98,6 +100,7 @@ func NewImporter(cfg config.Config, qd *qdrant.Qdrant, st *store.Store, cascadeX
 		faceThresh:  cfg.FaceThresh,
 		batchThresh: 0.58, // 批次内更严格阈值（ArcFace 同人 ≥ 0.65，不同人 ≤ 0.48，0.58 是安全分界）
 		seen:        []seenFace{},
+		enh:         enh,
 	}
 
 	// 检测器：优先 YuNet（DNN，准确率高且输出 5 点关键点）；加载失败回退 Haar cascade
@@ -377,14 +380,18 @@ func (im *Importer) processImage(path string) (int, int, error) {
 			continue
 		}
 
-		// ✅ 保存抠图（挪到 existing 检查之后）
-		rel, err := im.saveFaceCrop(personID, crop)
-		crop.Close()
-		if err != nil {
-			log.Printf("[import] 保存抠图失败: %v", err)
-			continue // 抠图存不了就别进 event log 了
+		// 预先确定抠图相对路径（确定性：import/{personID}.jpg），写事件日志时需要
+		rel := filepath.Join("import", personID+".jpg")
+
+		// ✅ 顺序：抠图 → Qdrant 向量 → 事件日志，任何一步失败都回滚已写部分，无脏数据
+		// 1) 先落盘抠图（本地写盘，失败则什么都不写）
+		if _, err := im.saveFaceCrop(personID, crop); err != nil {
+			log.Printf("[import] 保存抠图失败: %v（跳过，事件/Qdrant 均未写入）", err)
+			crop.Close()
+			continue
 		}
 
+		// 2) 再写 Qdrant 向量 + 事件日志（ImportFace 保证向量失败时不落事件）
 		if im.st != nil {
 			capturedAt := exifInfo.CreatedAt
 			if capturedAt.IsZero() {
@@ -402,7 +409,9 @@ func (im *Importer) processImage(path string) (int, int, error) {
 				Altitude:   exifInfo.Altitude,
 				Heading:    exifInfo.Heading,
 			}); err != nil {
-				log.Printf("[import] ImportFace 失败: %v", err)
+				log.Printf("[import] ImportFace 失败: %v（回滚已存抠图）", err)
+				os.Remove(filepath.Join(im.cfg.DataDir, "images", rel))
+				crop.Close()
 				continue
 			}
 		} else {
@@ -415,10 +424,13 @@ func (im *Importer) processImage(path string) (int, int, error) {
 				"crop":        rel,
 			}
 			if err := im.qd.UpsertFace(personID, embedding, payload); err != nil {
-				log.Printf("[import] upsert Qdrant 失败: %v", err)
+				log.Printf("[import] upsert Qdrant 失败: %v（回滚已存抠图）", err)
+				os.Remove(filepath.Join(im.cfg.DataDir, "images", rel))
+				crop.Close()
 				continue
 			}
 		}
+		crop.Close()
 		saved++
 	}
 
@@ -533,6 +545,10 @@ func (im *Importer) saveFaceCrop(personID string, crop gocv.Mat) (string, error)
 	gocv.Resize(crop, &target, image.Pt(160, 160), 0, 0, gocv.InterpolationLinear)
 	defer target.Close()
 	if gocv.IMWrite(full, target) {
+		// ✅ 异步高清增强：超分→锐化→还原原尺寸→覆盖原文件
+		if im.enh != nil {
+			im.enh.Enqueue(rel)
+		}
 		return rel, nil
 	}
 	return "", fmt.Errorf("gocv.IMWrite 失败")
@@ -764,22 +780,16 @@ func (im *Importer) hasFacialFeatures(crop gocv.Mat) bool {
 	return false
 }
 
-// isQualityFace 用 YuNet score + 5 点关键点 + Haar eye cascade 四重验证人脸质量。
-// 5 个点顺序：右眼中心、左眼中心、鼻尖、右嘴角、左嘴角。
-//
-// 通过条件（全部满足才返回 true）：
-//   A. YuNet Score ≥ 0.75（低质量脸 YuNet score 会降）
-//   B. 双眼水平距离 / 脸宽 ∈ [12%, 55%]（侧脸双眼叠一起 → 过小；过宽 → YuNet 检测框太窄，耳朵被裁）
-//   C. 双眼垂直倾斜 / 脸高 ≤ 30%（脸歪 → 过不了）
-//   D. 鼻尖 x ∈ 双眼区间 ± 20%（侧脸鼻尖跑眼睛外 → 过不了）
-//   E. MAR（嘴巴张合度）∈ [0.05, 0.45]（太小=闭嘴/花假 landmark，太大=假脸）
-//   F. 嘴巴水平宽度 ≥ 12% 脸宽（花的假嘴角挤在一起 → 过不了）
-//   G. 嘴巴中心 y ∈ [鼻尖+5%, 鼻尖+40%] faceH（严格在鼻子正下方）
-//   H. 所有 5 个 landmark 在脸 bbox ±5% 内
-//   I. 【闭眼拦截】双眼 landmark 附近 Haar eye cascade 必须能检测到
-//   J. 【耳朵空间】YuNet bbox 宽度 ≥ 双眼距离 × 1.8（正脸双眼间距占脸宽 ~40%，YuNet bbox 覆盖到耳朵）
-//      + 右眼角到 bbox 左边界 ≥ 15% faceW + 左眼角到 bbox 右边界 ≥ 15% faceW
-//      侧脸时 YuNet bbox 紧贴眼角 → 耳朵被裁 → 过不了
+//   A. YuNet Score ≥ 0.62（手机糊脸集中 0.60-0.74，卡 0.62 放行真脸）
+//   B. 双眼水平距离 / 脸宽 ∈ [6%, 65%]（真实分布 p50=0.074，广角/近脸都会偏小）
+//   C. 双眼垂直倾斜 / 脸高 ≤ 40%
+//   D. 鼻尖 x ∈ 双眼区间 ±35%
+//   E. MAR ∈ [0.01, 0.55]（闭嘴脸 YuNet mouth landmark y 几乎重合 → MAR→0，下限 0.01）
+//   F. 嘴巴水平宽度 ≥ 6% 脸宽
+//   G. 嘴巴中心 y ∈ [鼻尖+3%, 鼻尖+48%] faceH
+//   H. 所有 5 个 landmark 在脸 bbox ±8% 内
+//   I. 闭眼拦截：score ≥ 0.72 跳 Haar；score < 0.72 则至少一只眼被 Haar 检出
+//   J. 耳朵空间：YuNet bbox 左右各留 ≥ 6% faceW（侧脸 < 3%，近脸 p50=13-14%）
 func (im *Importer) isQualityFace(f YuFace, img gocv.Mat) bool {
 	faceW := float32(f.Rect.Dx())
 	faceH := float32(f.Rect.Dy())
@@ -787,7 +797,7 @@ func (im *Importer) isQualityFace(f YuFace, img gocv.Mat) bool {
 	bboxRight := float32(f.Rect.Max.X)
 
 	// A. YuNet score 门槛
-	if f.Score < 0.75 {
+	if f.Score < 0.62 {
 		return false
 	}
 
@@ -801,8 +811,7 @@ func (im *Importer) isQualityFace(f YuFace, img gocv.Mat) bool {
 			return false
 		}
 	}
-
-	if faceW < 30 || faceH < 30 {
+	if faceW < 25 || faceH < 25 {
 		return false
 	}
 	rightEye := lm[0]
@@ -811,79 +820,77 @@ func (im *Importer) isQualityFace(f YuFace, img gocv.Mat) bool {
 	rightMouth := lm[3]
 	leftMouth := lm[4]
 
-	// B. 双眼水平距离（上下限双重检查）
+	// B. 双眼水平距离 ∈ [6%, 65%] faceW
 	eyeDx := absF32(leftEye[0] - rightEye[0])
 	eyeDxRatio := eyeDx / faceW
-	if eyeDxRatio < 0.12 || eyeDxRatio > 0.55 {
-		// 太小=侧脸；太大=YuNet bbox 太窄，耳朵被裁掉了
+	if eyeDxRatio < 0.06 || eyeDxRatio > 0.65 {
 		return false
 	}
 
-	// C. 双眼垂直倾斜
+	// C. 双眼垂直倾斜 ≤ 40%
 	eyeDy := absF32(leftEye[1] - rightEye[1])
-	if eyeDy/faceH > 0.30 {
+	if eyeDy/faceH > 0.40 {
 		return false
 	}
 
-	// D. 鼻尖在双眼之间
+	// D. 鼻尖在双眼区间 ±35% eyeDx
 	eyeMinX := minF32(leftEye[0], rightEye[0])
 	eyeMaxX := maxF32(leftEye[0], rightEye[0])
-	if nose[0] < eyeMinX-eyeDx*0.2 || nose[0] > eyeMaxX+eyeDx*0.2 {
+	if nose[0] < eyeMinX-eyeDx*0.35 || nose[0] > eyeMaxX+eyeDx*0.35 {
 		return false
 	}
 
-	// E. MAR（嘴巴张合度）
+	// E. MAR（嘴巴张合度）∈ [0.01, 0.55]
 	mouthW := absF32(leftMouth[0] - rightMouth[0])
 	mouthH := absF32(leftMouth[1] - rightMouth[1])
 	if mouthW < 1 {
 		return false
 	}
 	mar := mouthH / mouthW
-	if mar < 0.05 || mar > 0.45 {
+	if mar < 0.01 || mar > 0.55 {
 		return false
 	}
 
-	// F. 嘴巴水平宽度 ≥ 12% 脸宽
-	if mouthW/faceW < 0.12 {
+	// F. 嘴巴水平宽度 ≥ 6% faceW
+	if mouthW/faceW < 0.06 {
 		return false
 	}
 
-	// G. 嘴巴中心严格在鼻尖下方
+	// G. 嘴巴中心 y ∈ [鼻尖+3%, 鼻尖+48%] faceH
 	mouthAvgY := (rightMouth[1] + leftMouth[1]) / 2
 	offset := mouthAvgY - nose[1]
-	if offset/faceH < 0.05 || offset/faceH > 0.40 {
+	if offset/faceH < 0.03 || offset/faceH > 0.48 {
 		return false
 	}
 
-	// H. 所有 landmark 在 face bbox 内
-	xb := bboxLeft - faceW*0.05
-	x2b := bboxRight + faceW*0.05
-	yb := float32(f.Rect.Min.Y) - faceH*0.05
-	y2b := float32(f.Rect.Max.Y) + faceH*0.05
+	// H. 所有 landmark 在 face bbox ±8% 内
+	xb := bboxLeft - faceW*0.08
+	x2b := bboxRight + faceW*0.08
+	yb := float32(f.Rect.Min.Y) - faceH*0.08
+	y2b := float32(f.Rect.Max.Y) + faceH*0.08
 	for k := 0; k < 5; k++ {
 		if lm[k][0] < xb || lm[k][0] > x2b || lm[k][1] < yb || lm[k][1] > y2b {
 			return false
 		}
 	}
 
-	// I. 闭眼拦截：双眼 landmark 附近 Haar eye cascade 必须能检测到
-	if im.eyeCascade != nil {
-		if !im.eyeOpenNear(img, rightEye[0], rightEye[1], faceW, faceH) ||
-			!im.eyeOpenNear(img, leftEye[0], leftEye[1], faceW, faceH) {
+	// I. 闭眼/假脸拦截——双策略：
+	//   高分 (≥0.72) → YuNet 自己不会给闭眼高分 → 跳过 Haar；
+	//   低分 (0.62-0.72) → 至少一只眼被 Haar 检出（兜底防假脸）
+	if f.Score < 0.72 && im.eyeCascade != nil {
+		rightOpen := im.eyeOpenNear(img, rightEye[0], rightEye[1], faceW, faceH)
+		leftOpen := im.eyeOpenNear(img, leftEye[0], leftEye[1], faceW, faceH)
+		if !rightOpen && !leftOpen {
 			return false
 		}
 	}
 
-	// J. ✅ 【耳朵空间】YuNet bbox 必须在左右眼角外各留 ≥ 15% faceW 的空间给耳朵
-	// 正脸时 YuNet bbox 覆盖左右耳朵 → bbox 宽 ≥ eyeDx × 1.8
-	// 侧脸 ≥ 30° 时远侧耳朵被裁 → bbox 紧贴眼角 → 过不了
-	minEarSpace := faceW * 0.15
-	// 右边：bbox 左边界 到 右眼角 landmark 的距离
+	// J. 耳朵空间：bbox 左右各留 ≥ 6% faceW（侧脸 < 3%，近脸 p50=13-14%）
+	minEarSpace := faceW * 0.06
 	rightEarSpace := rightEye[0] - bboxLeft
-	// 左边：bbox 右边界 到 左眼角 landmark 的距离
 	leftEarSpace := bboxRight - leftEye[0]
 	if rightEarSpace < minEarSpace || leftEarSpace < minEarSpace {
-		return false // 至少一侧耳朵空间不够 → 侧脸 / 耳朵被裁
+		return false
 	}
 
 	return true

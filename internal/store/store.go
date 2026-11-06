@@ -80,17 +80,25 @@ type Store struct {
 	eventsF *os.File
 	alertsF *os.File
 	labelsP string
+
+	// 增量 reload：记录 events.jsonl 上次加载到的字节数 + mtime，
+	// 跨进程 append 新行时，Web 进程的内存会自动追加。
+	eventsPath   string
+	eventsSize   int64
+	labelsSize   int64
+	labelsMtime  time.Time
 }
 
 func NewStore(cfg config.Config, qd *qdrant.Qdrant, geo *geo.Geocoder) (*Store, error) {
-	s := &Store{
-		cfg:      cfg,
-		qd:       qd,
-		geo:      geo,
-		labelsP:  filepath.Join(cfg.DataDir, "labels.json"),
-		cooldown: map[string]time.Time{},
-	}
 	evPath := filepath.Join(cfg.DataDir, "events.jsonl")
+	s := &Store{
+		cfg:        cfg,
+		qd:         qd,
+		geo:        geo,
+		labelsP:    filepath.Join(cfg.DataDir, "labels.json"),
+		cooldown:   map[string]time.Time{},
+		eventsPath: evPath,
+	}
 	f, err := os.OpenFile(evPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
 		return nil, err
@@ -112,9 +120,14 @@ func NewStore(cfg config.Config, qd *qdrant.Qdrant, geo *geo.Geocoder) (*Store, 
 			}
 			s.events = append(s.events, &e)
 		}
+		s.eventsSize = int64(len(b))
 	}
-	if b, err := os.ReadFile(s.labelsP); err == nil {
-		json.Unmarshal(b, &s.labels)
+	if st, err := os.Stat(s.labelsP); err == nil {
+		s.labelsSize = st.Size()
+		s.labelsMtime = st.ModTime()
+		if b, err := os.ReadFile(s.labelsP); err == nil {
+			json.Unmarshal(b, &s.labels)
+		}
 	}
 	alertsPath := filepath.Join(cfg.DataDir, "alerts.jsonl")
 	if b, err := os.ReadFile(alertsPath); err == nil {
@@ -437,12 +450,8 @@ func (s *Store) ImportFace(in ImportFaceInput) (*Event, error) {
 		PersonID:   in.PersonID,
 		CreatedAt:  time.Now(),
 	}
-	s.mu.Lock()
-	s.events = append(s.events, e)
-	s.mu.Unlock()
-	if err := s.appendEvents(e); err != nil {
-		log.Printf("[store] 写事件日志失败: %v", err)
-	}
+	// ✅ 先 upsert Qdrant 向量：失败 → 事件不落盘，调用方也不会存抠图，无脏数据
+	// 🔴 旧顺序（先事件后向量）在 Qdrant 短暂不可用时会产生"有事件无图片"的坏数据
 	payload := map[string]any{
 		"kind":        e.Kind,
 		"person_id":   e.PersonID,
@@ -464,7 +473,15 @@ func (s *Store) ImportFace(in ImportFaceInput) (*Event, error) {
 		payload["heading"] = *e.Heading
 	}
 	if err := s.qd.UpsertFace(e.PersonID, in.Vector, payload); err != nil {
-		return e, fmt.Errorf("upsert face: %w", err)
+		return nil, fmt.Errorf("upsert face: %w", err)
+	}
+
+	// ✅ 向量已入 Qdrant，事件才落盘（事件是 identities 展示依据，必须保证有图可指）
+	s.mu.Lock()
+	s.events = append(s.events, e)
+	s.mu.Unlock()
+	if err := s.appendEvents(e); err != nil {
+		return nil, fmt.Errorf("写事件日志: %w", err)
 	}
 	return e, nil
 }
@@ -611,6 +628,7 @@ func (s *Store) LabelsFor(e *Event) []*Label {
 
 // Labels 返回当前全部标签快照。
 func (s *Store) Labels() []*Label {
+	s.reloadLabelsIfStale()
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := make([]*Label, len(s.labels))
@@ -661,8 +679,27 @@ func (s *Store) AddLabel(name, eventID string, beep bool) (*Label, error) {
 	if target.Kind == "plate" {
 		t = target.PlateText
 	}
+	return s.addLabelLocked(name, target.Kind, t, beep)
+}
+
+// AddLabelForPersonID 直接给 face 身份（personID）打标签，无需 event。
+// 用于主界面"输入名字"自动打标签：即使本次采集被 cooldown 跳过也能把名字挂上。
+func (s *Store) AddLabelForPersonID(name, personID string, beep bool) (*Label, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return nil, errors.New("标签名不能为空")
+	}
+	if personID == "" {
+		return nil, errors.New("personID 为空")
+	}
+	s.mu.Lock()
+	return s.addLabelLocked(name, "face", personID, beep)
+}
+
+// addLabelLocked 在已持有 s.mu 的前提下添加或复用同名同目标标签，返回前解锁并落盘。
+func (s *Store) addLabelLocked(name, kind, target string, beep bool) (*Label, error) {
 	for _, l := range s.labels {
-		if l.Name == name && l.Kind == target.Kind && l.Target == t {
+		if l.Name == name && l.Kind == kind && l.Target == target {
 			l.Beep = l.Beep || beep
 			s.mu.Unlock()
 			s.saveLabels()
@@ -672,8 +709,8 @@ func (s *Store) AddLabel(name, eventID string, beep bool) (*Label, error) {
 	l := &Label{
 		ID:        newID(),
 		Name:      name,
-		Kind:      target.Kind,
-		Target:    t,
+		Kind:      kind,
+		Target:    target,
 		Beep:      beep,
 		CreatedAt: time.Now(),
 	}
@@ -711,6 +748,8 @@ func (s *Store) DeleteLabel(id string) error {
 
 // Events 返回按时间倒序的全部事件快照。
 func (s *Store) Events() []*Event {
+	s.reloadEventsIfStale()
+	s.reloadLabelsIfStale()
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := make([]*Event, len(s.events))
@@ -718,6 +757,92 @@ func (s *Store) Events() []*Event {
 		out[len(s.events)-1-i] = e
 	}
 	return out
+}
+
+// reloadEventsIfStale 增量读取 events.jsonl 中自上次加载以来追加的新行。
+// 场景：importfaces 子进程 append 新事件后，Web 进程的内存自动更新。
+func (s *Store) reloadEventsIfStale() {
+	st, err := os.Stat(s.eventsPath)
+	if err != nil {
+		return
+	}
+	currentSize := st.Size()
+
+	s.mu.RLock()
+	knownSize := s.eventsSize
+	s.mu.RUnlock()
+
+	if currentSize <= knownSize {
+		return // 无新数据（文件被截断这种极端情况这里不管）
+	}
+
+	f, err := os.Open(s.eventsPath)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	if _, err := f.Seek(knownSize, io.SeekStart); err != nil {
+		return
+	}
+
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	added := 0
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" {
+			continue
+		}
+		var e Event
+		if err := json.Unmarshal([]byte(line), &e); err != nil {
+			continue
+		}
+		s.events = append(s.events, &e)
+		k := identityKey(&e)
+		if t, ok := s.cooldown[k]; !ok || e.CapturedAt.After(t) {
+			s.cooldown[k] = e.CapturedAt
+		}
+		added++
+	}
+	s.eventsSize = currentSize
+	if added > 0 {
+		log.Printf("[store] 增量加载 %d 条新事件 (events.jsonl %d→%d bytes)", added, knownSize, currentSize)
+	}
+}
+
+// reloadLabelsIfStale 检查 labels.json 是否被其他进程改过（mtime/size 任一变化），
+// 变化则整文件重读覆盖内存中的 s.labels。
+func (s *Store) reloadLabelsIfStale() {
+	st, err := os.Stat(s.labelsP)
+	if err != nil {
+		return
+	}
+	s.mu.RLock()
+	knownSize := s.labelsSize
+	knownMtime := s.labelsMtime
+	s.mu.RUnlock()
+
+	if st.Size() == knownSize && st.ModTime().Equal(knownMtime) {
+		return // 没变
+	}
+
+	b, err := os.ReadFile(s.labelsP)
+	if err != nil {
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var newLabels []*Label
+	if err := json.Unmarshal(b, &newLabels); err == nil {
+		s.labels = newLabels
+	}
+	s.labelsSize = st.Size()
+	s.labelsMtime = st.ModTime()
+	log.Printf("[store] 重新加载 labels.json (%d 条)", len(s.labels))
 }
 
 func (s *Store) AlertsSince(since time.Time, limit int) []Alert {

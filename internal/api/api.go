@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"math"
 	"net/http"
 	"os"
@@ -15,6 +16,7 @@ import (
 
 	"vi/internal/auth"
 	"vi/internal/config"
+	"vi/internal/imgenh"
 	"vi/internal/importface"
 	"vi/internal/report"
 	"vi/internal/store"
@@ -27,12 +29,13 @@ type Server struct {
 	cfg config.Config
 	st  *store.Store
 	fc  *importface.FaceChecker // YuNet + Haar eye cascade，Web 采集时做完整五官验证（nil=不可用，跳过验证）
+	enh *imgenh.Enhancer        // 异步高清增强（nil=不增强）
 	mux *http.ServeMux
 }
 
 // NewServer 组装所有路由并返回一个 http.Handler。
-func NewServer(cfg config.Config, st *store.Store, fc *importface.FaceChecker) http.Handler {
-	s := &Server{cfg: cfg, st: st, fc: fc, mux: http.NewServeMux()}
+func NewServer(cfg config.Config, st *store.Store, fc *importface.FaceChecker, enh *imgenh.Enhancer) http.Handler {
+	s := &Server{cfg: cfg, st: st, fc: fc, enh: enh, mux: http.NewServeMux()}
 
 	// —— 公开接口（免登录）——
 	s.mux.HandleFunc("POST /api/login", s.handleLogin)
@@ -403,6 +406,8 @@ func (s *Server) handleCapture(w http.ResponseWriter, r *http.Request) {
 	gender := normAttr(r.FormValue("gender"), "male", "female")
 	ageRange := normAttr(r.FormValue("age_range"), "0-2", "3-9", "10-19", "20-29", "30-39", "40-49", "50-59", "60-69", "70+")
 	glasses := normAttr(r.FormValue("glasses"), "yes", "no")
+	// 主界面"输入名字"：自动采集到人脸时用它直接给该身份打标签（留空则不打）
+	labelName := strings.TrimSpace(r.FormValue("label_name"))
 
 	// 车牌先过正则校验（前端识别到的乱码直接在后端拒）
 	if kind == "plate" {
@@ -475,10 +480,29 @@ func (s *Server) handleCapture(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "%v", err)
 		return
 	}
+	// ✅ 异步高清增强：保存成功的抠图进队列（超分→锐化→还原原尺寸→覆盖原文件）
+	if s.enh != nil {
+		s.enh.Enqueue(rel)
+	}
 	if res.Skipped {
-		// cooldown 跳过：图片文件是确定性命名（personID+day），已存在就保留最新版本，不删除
+		// cooldown 跳过：没有新事件，但用户输入了名字仍要挂到该身份上
+		if kind == "face" && labelName != "" && personID != "" {
+			if _, err := s.st.AddLabelForPersonID(labelName, personID, false); err != nil {
+				log.Printf("[api] 自动打标签失败: %v", err)
+			}
+		}
+		// 图片文件是确定性命名（personID+day），已存在就保留最新版本，不删除
 		writeJSON(w, 200, map[string]any{"ok": true, "skipped": true})
 		return
+	}
+
+	// 自动打标签：主界面输入了名字 → 本次采集成功后直接给该身份打上
+	if kind == "face" && labelName != "" {
+		if _, err := s.st.AddLabel(labelName, res.Event.ID, false); err != nil {
+			log.Printf("[api] 自动打标签失败: %v", err)
+		} else {
+			res.Labels = s.st.LabelsFor(res.Event)
+		}
 	}
 
 	names := []string{}

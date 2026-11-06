@@ -15,6 +15,7 @@ import (
 	"vi/internal/auth"
 	"vi/internal/config"
 	"vi/internal/geo"
+	"vi/internal/imgenh"
 	"vi/internal/importface"
 	"vi/internal/qdrant"
 	"vi/internal/report"
@@ -167,7 +168,10 @@ func runServe() int {
 		log.Printf("[info] %s 不存在，Web 人脸质量验证降级为 L2 norm 检查", yunetPath)
 	}
 
-	srv := api.NewServer(cfg, st, fc)
+	// ✅ 高清增强：人脸抠图异步增强（×3 放大→锐化→还原原尺寸→覆盖原文件）
+	enh := imgenh.New(cfg.DataDir)
+
+	srv := api.NewServer(cfg, st, fc, enh)
 	log.Printf("vi 已启动: http://%s  (人脸阈值 %.2f, 冷却 %s)", cfg.Addr, cfg.FaceThresh, cfg.Cooldown)
 	if err := http.ListenAndServe(cfg.Addr, srv); err != nil {
 		log.Fatal(err)
@@ -333,7 +337,8 @@ func runImportFaces(args []string) int {
 		}
 	}
 
-	imp, err := importface.NewImporter(cfg, qd, st, cascadePath, arcPath, yunetPath, *label, *dryRun, *force)
+	enh := imgenh.New(cfg.DataDir)
+	imp, err := importface.NewImporter(cfg, qd, st, cascadePath, arcPath, yunetPath, *label, *dryRun, *force, enh)
 	if err != nil {
 		log.Fatalf("初始化 Importer 失败: %v", err)
 	}
@@ -353,6 +358,7 @@ func runImportFaces(args []string) int {
 	if err != nil {
 		log.Printf("[import] 有错误（部分成功）: %v", err)
 	}
+	enh.Wait() // 等高清增强队列排空再退出，防止任务丢失
 	fmt.Printf("\n✅ 导入完成：%d 张新人脸\n", n)
 	if strings.HasPrefix(*qdURL, "http://127.0.0.1") {
 		fmt.Println("💡 启动 vi serve 后即可在首页看到导入的人脸作为同一性识别")
