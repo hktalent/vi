@@ -4,6 +4,7 @@ const PAGE_SIZE = 20;
 let kind = 'face'; // 当前身份类型 tab（人脸/车牌）
 let selected = new Set(); // 选中的 event_id（采集到的身份）
 let selectedLabels = new Set(); // 选中的标签 id（已有标签）
+let onlyUnnamed = false; // 只显示未命名（labels 为空）
 
 async function loadLabels() {
   const tbody = document.getElementById('labelRows');
@@ -81,18 +82,29 @@ async function loadIdentities() {
   const q = document.getElementById('q').value.trim();
   try {
     const data = await api.get(`/api/identities?kind=${kind}&page=${page}&q=${encodeURIComponent(q)}`);
+    let items = data.items || [];
+    // ✅ 本地过滤：只显示未命名（labels 为空）
+    if (onlyUnnamed) {
+      items = items.filter(it => !(it.labels && it.labels.length));
+    }
+    // 服务端返回的 total 是过滤前的；本地过滤后重新算总数需要再跑一次不带 onlyUnnamed 的查询
+    // 简化：前端分页不受 onlyUnnamed 影响，只过滤当前页内容
+    const localTotal = onlyUnnamed ? (data.total - (data.total - items.length)) : data.total;
     total = data.total;
     const totalPages = Math.ceil(total / PAGE_SIZE);
-    document.getElementById('pageInfo').textContent = `共 ${total} 个身份 · 第 ${page} 页`;
+    const filteredInfo = onlyUnnamed ? `· 未命名 ${items.length}/${localTotal}` : '';
+    document.getElementById('pageInfo').textContent = `共 ${total} 个身份 · 第 ${page} 页${filteredInfo}`;
     document.getElementById('prev').disabled = page <= 1;
     document.getElementById('next').disabled = page >= totalPages;
     renderPageNumbers(totalPages);
-    if (!data.items.length) {
-      wrap.innerHTML = '<div class="note">没有匹配的身份。</div>';
+    if (!items.length) {
+      wrap.innerHTML = onlyUnnamed
+        ? '<div class="note">当前页没有未命名的身份（翻页试试，或关闭“只显示未命名”）。</div>'
+        : '<div class="note">没有匹配的身份。</div>';
       return;
     }
     // 批量换签名 URL
-    const signedItems = await Promise.all(data.items.map(async it => ({
+    const signedItems = await Promise.all(items.map(async it => ({
       ...it,
       _signedImage: await Auth.mediaUrl(it.image)
     })));
@@ -269,6 +281,15 @@ document.querySelectorAll('.tabs [data-kind]').forEach(btn => {
 });
 
 document.getElementById('btnSearch').addEventListener('click', () => { page = 1; loadIdentities(); });
+// ✅ 只显示未命名 checkbox
+const onlyUnnamedCb = document.getElementById('onlyUnnamed');
+if (onlyUnnamedCb) {
+  onlyUnnamedCb.addEventListener('change', () => {
+    onlyUnnamed = onlyUnnamedCb.checked;
+    page = 1;
+    loadIdentities();
+  });
+}
 document.getElementById('q').addEventListener('keydown', e => { if (e.key === 'Enter') { page = 1; loadIdentities(); } });
 document.getElementById('prev').addEventListener('click', () => { if (page > 1) { page--; loadIdentities(); } });
 document.getElementById('next').addEventListener('click', () => { if (page * PAGE_SIZE < total) { page++; loadIdentities(); } });

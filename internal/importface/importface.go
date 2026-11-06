@@ -190,7 +190,7 @@ func (im *Importer) Run(dir string) (int, error) {
 	var firstErr error
 	for i, p := range imagePaths {
 		fmt.Fprintf(os.Stderr, "\r[%d/%d] %s", i+1, len(imagePaths), filepath.Base(p))
-		faces, err := im.processImage(p)
+		faces, _, err := im.processImage(p)
 		if err != nil {
 			failed++
 			if firstErr == nil {
@@ -210,10 +210,10 @@ func (im *Importer) Run(dir string) (int, error) {
 }
 
 // processImage 处理一张图片：检测所有人脸 → embedding 去重 → 保存。
-func (im *Importer) processImage(path string) (int, error) {
+func (im *Importer) processImage(path string) (int, int, error) {
 	img := gocv.IMRead(path, gocv.IMReadColor)
 	if img.Empty() {
-		return 0, fmt.Errorf("无法读取")
+		return 0, 0, fmt.Errorf("无法读取")
 	}
 	defer img.Close()
 
@@ -243,18 +243,19 @@ func (im *Importer) processImage(path string) (int, error) {
 		rects = im.cascade.DetectMultiScaleWithParams(detectImg, 1.2, 6, 0, image.Pt(50, 50), image.Pt(0, 0))
 		detectImg.Close()
 	}
-	im.writeFacesLog(path, len(rects))
 
 	if len(rects) == 0 {
-		return 0, nil
+		return 0, 0, nil
 	}
 
 	saved := 0
+	filteredThisImg := 0
 	for i, r := range rects {
 		// YuNet 模式下用 score + 5 点关键点 + Haar eye cascade 三重验证五官完整性 + 睁眼
 		if im.yunet != nil && i < len(yuFaces) {
 			if !im.isQualityFace(yuFaces[i], img) {
 				im.filtered++
+				filteredThisImg++
 				continue
 			}
 		}
@@ -347,7 +348,7 @@ func (im *Importer) processImage(path string) (int, error) {
 			personID = pid
 			log.Printf("[import] 批次内同人复用 personID=%s (sim=%.3f)", personID, score)
 		} else if im.qd != nil {
-			// 也用 batchThresh（0.58），比 cfg.FaceThresh（0.45）严格，避免跨批次不同人被误合并
+			// 也用 batchThresh（0.58），比 cfg.FaceThresh（0.52）严格，避免跨批次不同人被误合并
 			if hit, err := im.qd.SearchFace(embedding, im.batchThresh); err == nil && hit.ID != "" {
 				if pid, ok := hit.Payload["person_id"].(string); ok && pid != "" {
 					personID = pid
@@ -359,25 +360,29 @@ func (im *Importer) processImage(path string) (int, error) {
 			personID = newPersonID(im.label)
 		}
 
-		// 保存抠图
-		rel, err := im.saveFaceCrop(personID, crop)
-		crop.Close()
-		if err != nil {
-			log.Printf("[import] 保存抠图失败: %v", err)
-		}
-
-		// 记录到批次 seen 列表，后续同人匹配用
+		// 记录到批次 seen 列表，后续同人匹配用（existing 检查之前就要加，否则同一张图里的多张同人脸会重复生成 personID）
 		im.seen = append(im.seen, seenFace{personID: personID, vec: embedding})
 
 		// ImportFace 的 existing 检查：personID 已存在（-force 模式）→ 跳过
+		// 🔴 必须在 saveFaceCrop 之前检查，避免磁盘 I/O + 覆盖已存图片
 		if !im.force && im.existing != nil && im.existing[personID] {
+			crop.Close()
 			im.skipped++
 			continue
 		}
 
 		if im.dryRun {
+			crop.Close()
 			saved++
 			continue
+		}
+
+		// ✅ 保存抠图（挪到 existing 检查之后）
+		rel, err := im.saveFaceCrop(personID, crop)
+		crop.Close()
+		if err != nil {
+			log.Printf("[import] 保存抠图失败: %v", err)
+			continue // 抠图存不了就别进 event log 了
 		}
 
 		if im.st != nil {
@@ -417,7 +422,19 @@ func (im *Importer) processImage(path string) (int, error) {
 		saved++
 	}
 
-	return saved, nil
+	// ✅ 真正可信的日志：原始检测 / 通过五官 / 被过滤
+	if len(rects) > 0 {
+		p := filepath.Base(path)
+		switch {
+		case saved > 0 && filteredThisImg > 0:
+			log.Printf("[import] %s → 检测 %d 张 · 通过五官 %d · 过滤 %d（闭眼/侧脸/五官不全）", p, len(rects), saved, filteredThisImg)
+		case saved > 0:
+			log.Printf("[import] %s → %d 张人脸（全部通过五官检查）", p, saved)
+		default:
+			log.Printf("[import] %s → 检测 %d 张 · 全部被五官检查过滤（闭眼/侧脸/五官不全）", p, len(rects))
+		}
+	}
+	return saved, filteredThisImg, nil
 }
 
 // extractEmbedding 用 arc.onnx 提取 512 维特征向量。

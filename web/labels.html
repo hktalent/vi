@@ -5,6 +5,41 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>vi · 标签</title>
   <link rel="stylesheet" href="/css/style.css" />
+  <style>
+    /* 已有标签表：表头固定 + tbody 限高 350px 滚动 */
+    .label-table-wrap {
+      max-height: 380px; /* 表头 ~30px + tbody 350px */
+      overflow: hidden;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+    }
+    .label-table-wrap table { width: 100%; border-collapse: collapse; }
+    .label-table-wrap thead {
+      position: sticky; top: 0; z-index: 2;
+      background: var(--surface-2, #1e1e2e);
+    }
+    .label-table-wrap thead th {
+      padding: 8px 10px; font-size: 12px;
+      border-bottom: 1px solid var(--border);
+      text-align: left;
+      white-space: nowrap;
+    }
+    .label-table-wrap thead th:first-child { width: 32px; text-align: center; }
+    .label-table-wrap thead th:last-child { width: 60px; text-align: center; }
+    .label-table-wrap tbody {
+      display: block; max-height: 350px; overflow-y: auto;
+    }
+    .label-table-wrap thead,
+    .label-table-wrap tbody tr {
+      display: table; width: 100%; table-layout: fixed;
+    }
+    .label-table-wrap tbody tr td {
+      padding: 7px 10px; font-size: 13px;
+      border-bottom: 1px solid var(--border-soft, #2a2a3a);
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .label-table-wrap tbody tr:hover { background: var(--surface-2, #1e1e2e); }
+  </style>
 </head>
 <body>
   <header class="topbar">
@@ -19,27 +54,17 @@
 
   <main class="wrap">
     <h1>标签管理</h1>
-    <p class="sub">给已经采集到的人脸 / 车牌起名字。给同一个身份打标签后，之后每次再见到都会命中；勾选“鸣叫”即可在监测页自动发声。</p>
+    <p class="sub">给已经采集到的人脸 / 车牌起名字。给同一个身份打标签后，之后每次再见到都会命中；勾选"鸣叫"即可在监测页自动发声。</p>
 
+    <!-- === 采集到的身份（放在上面） === -->
     <section class="panel">
-      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;">
-        <h2 style="margin:0;">已有标签</h2>
-        <button class="btn small danger" id="btnDelLabels" style="display:none;">删除选中</button>
-      </div>
-      <div style="overflow:auto;">
-        <table>
-          <thead>
-            <tr><th style="width:32px;"><input type="checkbox" id="selAllLabels" title="全选" /></th><th>标签</th><th>类型</th><th>身份</th><th>出现次数</th><th>最近出现</th><th>鸣叫</th><th></th></tr>
-          </thead>
-          <tbody id="labelRows"><tr><td colspan="8" class="muted">加载中…</td></tr></tbody>
-        </table>
-      </div>
-    </section>
-
-    <section class="panel" style="margin-top: 16px;">
       <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;">
         <h2 style="margin:0;">采集到的身份</h2>
         <div style="display:flex;gap:8px;align-items:center;">
+          <label class="chip" style="cursor:pointer;font-size:12px;">
+            <input type="checkbox" id="onlyUnnamed" style="vertical-align:middle;margin-right:4px;" />
+            只显示未命名
+          </label>
           <button class="btn small" id="btnSelectAll">全选</button>
           <input class="input" id="batchLabel" placeholder="标签名" style="width:100px;display:none;" />
           <button class="btn small primary" id="btnBatchLabel" style="display:none;">批量打标</button>
@@ -58,6 +83,33 @@
         <button class="btn small" id="prev">上一页</button>
         <span id="pageNumbers" style="display:inline-flex;gap:4px;align-items:center;"></span>
         <button class="btn small" id="next">下一页</button>
+      </div>
+    </section>
+
+    <!-- === 已有标签（放在下面） === -->
+    <section class="panel" style="margin-top: 16px;">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;">
+        <h2 style="margin:0;">已有标签</h2>
+        <button class="btn small danger" id="btnDelLabels" style="display:none;">删除选中</button>
+      </div>
+      <div class="label-table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th><input type="checkbox" id="selAllLabels" title="全选" /></th>
+              <th>标签</th>
+              <th>类型</th>
+              <th>身份</th>
+              <th>次数</th>
+              <th>最近出现</th>
+              <th>鸣叫</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody id="labelRows">
+            <tr><td colspan="8" class="muted" style="text-align:center;padding:20px;">加载中…</td></tr>
+          </tbody>
+        </table>
       </div>
     </section>
   </main>
