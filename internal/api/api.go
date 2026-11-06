@@ -38,6 +38,8 @@ func NewServer(cfg config.Config, st *store.Store) http.Handler {
 	s.mux.HandleFunc("GET /api/health", s.handleHealth)
 	// /api/capture 保持公开：实时采集是核心功能，首页免登录也能上传
 	s.mux.HandleFunc("POST /api/capture", s.handleCapture)
+	// /api/geocode 公开：首页实时定位展示地址用
+	s.mux.HandleFunc("GET  /api/geocode", s.handleGeocode)
 
 	// —— 需登录 ——
 	s.mux.HandleFunc("GET  /api/media-url", auth.RequireAuth(s.handleMediaSignedURL))
@@ -217,6 +219,21 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleGeocode 公开接口：前端拿到 GPS 后实时查逆地理地址。直接用 Store 持有的 Geocoder（带本地缓存）。
+func (s *Server) handleGeocode(w http.ResponseWriter, r *http.Request) {
+	lat, lon := parseLatLon(r.URL.Query().Get("lat"), r.URL.Query().Get("lon"))
+	if lat == nil || lon == nil {
+		writeJSON(w, 400, map[string]any{"error": "缺少 lat / lon 参数"})
+		return
+	}
+	addr := s.st.Reverse(lat, lon)
+	writeJSON(w, 200, map[string]any{
+		"address": addr,
+		"lat":     *lat,
+		"lon":     *lon,
+	})
+}
+
 type labelView struct {
 	ID          string `json:"id"`
 	Name        string `json:"name"`
@@ -363,6 +380,8 @@ func (s *Server) handleCapture(w http.ResponseWriter, r *http.Request) {
 	}
 
 	lat, lon := parseLatLon(r.FormValue("lat"), r.FormValue("lon"))
+	altitude := parseFloatPtr(r.FormValue("altitude"))
+	heading := parseFloatPtr(r.FormValue("heading"))
 
 	var vec []float32
 	if v := r.FormValue("vector"); v != "" {
@@ -408,6 +427,8 @@ func (s *Server) handleCapture(w http.ResponseWriter, r *http.Request) {
 		CapturedAt: ts,
 		Lat:        lat,
 		Lon:        lon,
+		Altitude:   altitude,
+		Heading:    heading,
 		Vector:     vec,
 		PlateText:  plate,
 		PlateConf:  plateConf,
@@ -496,6 +517,19 @@ func parseLatLon(la, lo string) (*float64, *float64) {
 		return nil, nil
 	}
 	return &a, &b
+}
+
+// parseFloatPtr 解析字符串为 float64 指针，空串或非法值返回 nil。
+func parseFloatPtr(v string) *float64 {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return nil
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil || math.IsNaN(f) || math.IsInf(f, 0) {
+		return nil
+	}
+	return &f
 }
 
 func normAttr(v string, allowed ...string) string {

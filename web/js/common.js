@@ -220,6 +220,8 @@ function todayStr() {
 const geoState = {
   lat: null,
   lon: null,
+  altitude: null,  // 海拔（米），GPS 提供
+  heading: null,   // 相机方向角度（0=北, 90=东），来自 DeviceOrientationEvent
   accuracy: null,
   watchId: null,
   timer: null,
@@ -232,7 +234,12 @@ const geoState = {
       geoState.lat = pos.coords.latitude;
       geoState.lon = pos.coords.longitude;
       geoState.accuracy = pos.coords.accuracy;
-      if (onChange) onChange({ lat: geoState.lat, lon: geoState.lon, accuracy: geoState.accuracy });
+      geoState.altitude = pos.coords.altitude;  // GPS 海拔（可能为 null）
+      if (onChange) onChange({
+        lat: geoState.lat, lon: geoState.lon,
+        altitude: geoState.altitude, accuracy: geoState.accuracy,
+        heading: geoState.heading,
+      });
     };
     const fail = err => {
       if (onChange) onChange({ error: err.message || '定位失败' });
@@ -244,14 +251,68 @@ const geoState = {
     navigator.geolocation.getCurrentPosition(handle, fail, {
       enableHighAccuracy: true, maximumAge: 3000, timeout: 8000
     });
+
+    // 设备方向传感器（提供 compassHeading/alpha）
+    if ('DeviceOrientationEvent' in window) {
+      const orientHandler = e => {
+        // iOS 13+ 需要用户手动授权，Android/桌面直接触发
+        // webkitCompassHeading 是 iOS Safari 提供的真北方向（0=北，90=东）
+        // alpha 是相对屏幕的角度，Android 设备上需要做适配
+        let h = e.webkitCompassHeading;
+        if (h == null && e.alpha != null) {
+          // Android Chrome: alpha 范围 0-360（0=北），但需要校验是否是绝对值
+          h = e.alpha;
+          if (h < 0) h += 360;
+        }
+        if (h != null && !isNaN(h)) {
+          geoState.heading = Math.round(h);
+          if (onChange) onChange({ heading: geoState.heading });
+        }
+      };
+      window.addEventListener('deviceorientation', orientHandler, true);
+      geoState._orientHandler = orientHandler;
+      // iOS 13+ 需要请求权限
+      if (typeof DeviceOrientationEvent.requestPermission === 'function') {
+        // 延迟请求——需要在用户手势（click）内触发，由 start() 的调用方处理
+        geoState._needOrientPerm = true;
+      }
+    }
   },
   stop() {
     if (geoState.watchId !== null && navigator.geolocation) {
       navigator.geolocation.clearWatch(geoState.watchId);
       geoState.watchId = null;
     }
+    if (geoState._orientHandler) {
+      window.removeEventListener('deviceorientation', geoState._orientHandler, true);
+      geoState._orientHandler = null;
+    }
+  },
+  // iOS 13+ 需要在用户手势里调此方法请求方向传感器权限
+  async requestOrientPermission() {
+    if (typeof DeviceOrientationEvent.requestPermission === 'function') {
+      try {
+        const res = await DeviceOrientationEvent.requestPermission();
+        geoState._orientPermGranted = (res === 'granted');
+        return geoState._orientPermGranted;
+      } catch (_) {
+        return false;
+      }
+    }
+    return true;
   }
 };
+
+// headingToDirection: 把角度（0=北, 90=东）转为方位中文名
+function headingToDirection(deg) {
+  if (deg == null || isNaN(deg)) return '';
+  // 归一化到 [0, 360)
+  let d = ((deg % 360) + 360) % 360;
+  // 8 方位 + 中心点 22.5° 间隔
+  const dirs = ['北', '东北', '东', '东南', '南', '西南', '西', '西北'];
+  const idx = Math.round(d / 45) % 8;
+  return dirs[idx];
+}
 
 function setChip(id, ok, text) {
   const el = document.getElementById(id);
@@ -275,4 +336,5 @@ window.todayStr = todayStr;
 window.geoState = geoState;
 window.setChip = setChip;
 window.fmtCoord = fmtCoord;
+window.headingToDirection = headingToDirection;
 window._isIOSSafari = _isIOSSafari;

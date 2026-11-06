@@ -64,6 +64,10 @@ async function addFeed(res, kind, localBlobUrl) {
     // 备选：后端鉴权 URL（历史数据 / 标签页刷新后）
     imgUrl = await Auth.mediaUrl(e.image);
   }
+  // 附加元信息：海拔、方向
+  const extras = [];
+  if (e.altitude != null && !isNaN(e.altitude)) extras.push(`海拔 ${Math.round(e.altitude)}m`);
+  if (e.heading != null && !isNaN(e.heading)) extras.push(`方向 ${headingToDirection(e.heading)}`);
   const div = document.createElement('div');
   div.className = 'feed-item';
   const imgHtml = imgUrl
@@ -77,6 +81,7 @@ async function addFeed(res, kind, localBlobUrl) {
       ${attrs ? '<div class="meta">' + esc(attrs) + '</div>' : ''}
       <div class="meta">${esc(e.captured_at)} · ${esc(e.address || '无地址')}</div>
       <div class="meta">${esc(fmtCoord(e.lat, e.lon))}</div>
+      ${extras.length ? '<div class="meta muted">' + esc(extras.join(' · ')) + '</div>' : ''}
     </div>`;
   feed.prepend(div);
   while (feed.children.length > 30) { feed.lastChild.remove(); }
@@ -103,6 +108,12 @@ function formData(kind, capturedAt) {
   if (geoState.lat != null) {
     fd.append('lat', String(geoState.lat));
     fd.append('lon', String(geoState.lon));
+  }
+  if (geoState.altitude != null && !isNaN(geoState.altitude)) {
+    fd.append('altitude', String(geoState.altitude));
+  }
+  if (geoState.heading != null && !isNaN(geoState.heading)) {
+    fd.append('heading', String(geoState.heading));
   }
   return fd;
 }
@@ -375,6 +386,10 @@ async function loadEngines() {
 async function start() {
   document.getElementById('btnStart').disabled = true;
   try {
+    // iOS 13+ 方向传感器授权必须在当前用户手势内（click）调用 requestPermission
+    if (geoState._needOrientPerm) {
+      try { await geoState.requestOrientPermission(); } catch (_) {}
+    }
     const stream = await openCamera();
     video.srcObject = stream;
     await video.play();
@@ -447,15 +462,78 @@ async function stop() {
   if (geoState.watchId !== null) { geoState.stop(); }
 }
 
+// Haversine: 两点 GPS 坐标的球面距离（米）。
+function _haversine(lat1, lon1, lat2, lon2) {
+  const R = 6371000; // 地球半径 m
+  const toRad = d => d * Math.PI / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a = Math.sin(dLat / 2) ** 2 +
+            Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(a));
+}
+
+// 逆地理缓存：位移超过 GEO_REFRESH_DIST_M 米才重新请求后端。
+// 一旦拿到地址就稳定显示，不会被坐标噪声打断。
+const GEO_REFRESH_DIST_M = 50;   // 50 米内的 GPS 抖动不再刷新
+let _cachedAddr = '';             // 上次逆地理结果（稳定显示）
+let _cachedLat = null, _cachedLon = null; // 上次请求时的坐标
+let _geoRefreshPending = false;   // 防止并发重复请求
+
+async function refreshStageGeoHud() {
+  const el = document.getElementById('stageGeoMeta');
+  if (!el) return;
+  const g = geoState;
+  if (g.lat == null) { el.textContent = '等待定位...'; return; }
+
+  // 方向 + 海拔（实时，传感器变化就更新）
+  const extras = [];
+  if (g.heading != null && !isNaN(g.heading)) {
+    extras.push(`方向 ${headingToDirection(g.heading)}`);
+  }
+  if (g.altitude != null && !isNaN(g.altitude)) {
+    extras.push(`海拔 ${Math.round(g.altitude)}m`);
+  }
+
+  // 判断是否需要重新逆地理（位移超阈值 / 首次）
+  const needRefresh =
+    (_cachedLat == null) ||                                    // 首次
+    (_cachedAddr === '') ||                                    // 上次没拿到地址
+    (_haversine(g.lat, g.lon, _cachedLat, _cachedLon) > GEO_REFRESH_DIST_M);
+
+  if (needRefresh && !_geoRefreshPending) {
+    _geoRefreshPending = true;
+    _cachedLat = g.lat; _cachedLon = g.lon;
+    try {
+      const j = await fetch(`/api/geocode?lat=${g.lat}&lon=${g.lon}`).then(r => r.json());
+      if (j && j.address && j.address.trim()) _cachedAddr = j.address.trim();
+    } catch (_) { /* 失败保持上次的地址，不要清空 */ }
+    _geoRefreshPending = false;
+  }
+
+  // 显示：优先地址，地址为空才用坐标兜底
+  const mainText = _cachedAddr || fmtCoord(g.lat, g.lon);
+  el.textContent = mainText + (extras.length ? ' | ' + extras.join(' · ') : '');
+}
+
 function onGeo(g) {
   const el = document.getElementById('geoText');
   if (g.error) {
     setChip('chipGeo', false, '定位失败');
     el.textContent = '定位失败：' + g.error + '（采集仍会继续）';
+    refreshStageGeoHud();
     return;
   }
   setChip('chipGeo', true, '已定位 ±' + Math.round(g.accuracy || 0) + 'm');
-  el.textContent = `当前坐标：${fmtCoord(g.lat, g.lon)}，精度约 ${Math.round(g.accuracy || 0)} 米；每次上传都会携带定位与时间。`;
+  const parts = [`当前坐标：${fmtCoord(g.lat, g.lon)}`];
+  if (g.altitude != null && !isNaN(g.altitude)) parts.push(`海拔 ${Math.round(g.altitude)}m`);
+  if (geoState.heading != null && !isNaN(geoState.heading)) {
+    parts.push(`方向 ${headingToDirection(geoState.heading)} (${geoState.heading}°)`);
+  }
+  parts.push(`精度约 ${Math.round(g.accuracy || 0)} 米；每次上传都会携带定位与时间。`);
+  el.textContent = parts.join('，');
+  // 同步更新视频左上角 hud（chipCamera 同一行）
+  refreshStageGeoHud();
 }
 
 async function health() {

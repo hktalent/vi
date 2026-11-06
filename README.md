@@ -17,8 +17,9 @@
 | 🔎 **多维度检索** | 按日期 / 车牌 / 标签名 / 地名分页（每页 20 条） |
 | 📊 **统计面板** | 区间内人脸次数、不同人员数、车牌次数、时段分布、标签命中率 |
 | 📅 **每日 Markdown 总结** | 自动（可手动触发）生成当日概览 + 标签命中 + 时段 + 高频地点 + 最近记录 |
-| 🗺️ **定位 + 地址** | 浏览器 Geolocation + BigDataCloud 免 key 逆地理编码，本地缓存 |
-| 📱 **手机端** | 响应式布局 + 竖长视频预览 + 设备枚举切换摄像头（前后置） |
+| 🗺️ **定位 + 地址 + 海拔 + 方向** | 浏览器 Geolocation 提供经纬度/海拔，DeviceOrientation 提供相机方向角度，后端高德/Open-Meteo 逆地理编码，本地缓存；方向入库角度，前端显示中文方位（东北/西/南…） |
+| 📸 **批量图片导入** | `vi importfaces -dir /path` 递归扫描本地图片 → Haar/YuNet 检测 → ArcFace 提特征 → upsert Qdrant；**自动解析 EXIF**：GPS 坐标 → 逆地理得中文地址；GPSImgDirection → 相机方向；Altitude → 海拔；DateTimeOriginal 作 captured_at |
+| 📱 **手机端** | 响应式布局 + 竖长视频预览 + 设备枚举切换摄像头（前后置）；iOS 13+ 方向传感器需用户授权 |
 | 🔒 **隐私友好** | 推理全在本地浏览器完成；后端只收裁剪图 + 向量 + GPS |
 
 ---
@@ -95,16 +96,18 @@
 
 | 层 | 技术 | 版本 |
 |---|---|---|
-| 后端 | Go | 1.22 |
+| 后端 | Go | 1.22+ |
 | 后端 HTTP | `net/http`（标准库，无框架） | — |
-| 向量存储 | Qdrant | 1.12.4 |
+| 后端 CGO | OpenCV 4（gocv v0.38.0） | Homebrew / apt |
+| EXIF 解析 | `github.com/rwcarlsen/goexif` | 最新 |
+| 向量存储 | Qdrant | **下载见下方**（已内置 `bin/qdrant`） |
 | 前端运行 | vanilla JS（无构建、无打包） | — |
 | 人脸检测 | MediaPipe FaceLandmarker | 最新 WASM |
 | 人脸特征 | ONNX Runtime Web · ArcFace R100 FP32 | — |
 | 属性识别 | FairFace (gender + age) · ViT (glasses) | — |
 | 车牌检测 | HyperLPR YOLO · ONNX | — |
 | 车牌识别 | CRNN · CTC · ONNX | — |
-| 逆地理编码 | BigDataCloud 免 key API | — |
+| 逆地理编码 | 高德 Web Service Key（可选，国内坐标准） / Open-Meteo 免 key 备用 | — |
 
 ---
 
@@ -112,21 +115,35 @@
 
 ```
 vi/
-├── main.go          # 入口 + 配置加载 + 启动
-├── api.go           # HTTP 路由 + API handler
-├── store.go         # 事件 / 标签 / 告警 / 冷却 管理
-├── qdrant.go        # Qdrant REST 客户端
-├── geo.go           # 逆地理编码 + 本地缓存
-├── report.go        # 每日 Markdown 总结 + 定时调度
+├── main.go                    # 入口 + 子命令路由（serve / importfaces / reset / version / help）
+├── internal/
+│   ├── api/api.go             # HTTP 路由 + API handler（capture / search / labels / stats …）
+│   ├── auth/auth.go           # Token 签发 + 媒体 URL 签名 + 密码哈希
+│   ├── config/config.go       # 配置加载（flag + env + 默认值）
+│   ├── geo/geo.go             # 逆地理编码（高德优先 / Open-Meteo 备用）+ WGS-84 ↔ GCJ-02 + 本地缓存
+│   ├── importface/importface.go  # 批量图片导入：检测 → 裁剪 → ArcFace → upsert
+│   ├── importface/yunet.go       # YuNet 人脸检测器（ONNX DNN，5 点关键点）
+│   ├── exif/exif.go              # 图片 EXIF 解析：GPS/海拔/方向/创建时间
+│   ├── qdrant/qdrant.go       # Qdrant REST 客户端（dense + sparse）
+│   ├── store/store.go         # Event / Label / Alert / Cooldown / 落盘 / JSONL
+│   └── report/report.go      # 每日 Markdown 总结 + 定时调度
 ├── go.mod
-├── start.sh         # 一键启动（qdrant + vi）
-├── stop.sh          # 停止
+├── start.sh                   # 一键启动（首次自动 patch gocv + 编译 + 拉起 Qdrant）
+├── impt.sh                    # 批量导入脚本：./impt.sh <图片目录> [标签]
+├── stop.sh                    # 停止
 │
 ├── bin/
-│   ├── vi           # 编译后的后端二进制
-│   └── qdrant       # Qdrant 可执行文件
+│   ├── vi                     # 编译后的后端二进制（全功能，含 importfaces）
+│   └── qdrant                 # Qdrant 可执行文件（见下方下载说明）
 │
-├── models/          # 前端推理模型（~400MB）
+├── .build/gocv/               # gocv patch 目录（解决 OpenCV 4.11+ videoio 兼容）
+├── scripts/
+│   ├── patch-gocv.sh          # 自动 patch gocv（幂等，go.mod replace）
+│   ├── gocv-videoio-stub.cpp  # OpenCV 4.11+ videoio 兼容 stub
+│   ├── prepare_models.py      # 模型下载 / 导出脚本
+│   └── export_glasses.py      # 眼镜分类模型导出
+│
+├── models/                    # 前端推理模型（~400MB）
 │   ├── face_landmarker.task   # 3.7MB · MediaPipe 人脸关键点
 │   ├── arc.onnx               # 130MB · ArcFace R100 FP32
 │   ├── face_gender.onnx       # 83MB · FairFace 性别
@@ -146,19 +163,15 @@ vi/
 │   │   ├── capture.js         # 采集编排 + 推理队列 + 上传
 │   │   ├── face.js            # 人脸引擎（检测 + 对齐 + embed + attrs）
 │   │   ├── plate.js           # 车牌引擎（检测 + 识别）
-│   │   └── common.js          # 通用工具（API / 定位 / 鸣叫 / 缓存状态）
+│   │   └── common.js          # 通用工具（API / 定位含海拔 + DeviceOrientation 方向传感器 / 鸣叫 / 方位转换）
 │   └── vendor/
 │       ├── ort/               # ONNX Runtime Web WASM（4 线程 SIMD）
 │       └── mp/                # MediaPipe vision bundle + wasm
 │
-├── scripts/
-│   ├── prepare_models.py      # 模型下载 / 导出脚本
-│   └── export_glasses.py      # 眼镜分类模型导出
-│
 └── data/                      # 运行时数据（自动创建）
-    ├── images/YYYY/MM/DD/     # 人脸 / 车牌裁剪图
+    ├── images/YYYY/MM/DD/     # 人脸 / 车牌裁剪图 + import/ 导入抠图
     ├── qdrant/                # Qdrant 向量库数据
-    ├── events.jsonl           # 事件日志
+    ├── events.jsonl           # 事件日志（含 altitude / heading）
     ├── labels.json            # 标签表
     ├── alerts.jsonl           # 告警日志
     ├── geo_cache.json         # 地址缓存
@@ -174,18 +187,57 @@ vi/
 
 | 依赖 | 版本 | 说明 |
 |---|---|---|
-| Go | ≥ 1.22 | 仅在首次编译 / 改代码后需要 |
-| Qdrant 二进制 | 1.12.4 | 项目内已带 `bin/qdrant` |
+| **Go** | ≥ 1.22 | **编译需要 CGO 开启**（gocv 依赖） |
+| **OpenCV 4** | ≥ 4.8 | macOS: `brew install opencv`；Ubuntu: `apt install libopencv-dev` |
+| **pkg-config** | — | macOS Homebrew 自带；Ubuntu: `apt install pkg-config` |
+| **Qdrant 二进制** | **见下方下载** | 裸进程放到 `bin/qdrant`，start.sh 自动拉起 |
 | 现代浏览器 | Chrome / Edge / Safari | 需要支持 WebAssembly + SharedArrayBuffer |
 | HTTPS 或 `127.0.0.1` | — | 浏览器摄像头权限要求安全上下文 |
+
+#### Qdrant 下载地址
+
+Qdrant 官方 releases：[https://github.com/qdrant/qdrant/releases](https://github.com/qdrant/qdrant/releases)
+
+**vi 项目用裸二进制进程启动**（`start.sh` 会自动拉起 `./bin/qdrant`），只需下载对应架构的可执行文件放到 `bin/` 目录：
+
+```bash
+# macOS arm64 (Apple Silicon)
+curl -L -o bin/qdrant https://github.com/qdrant/qdrant/releases/download/v1.12.4/qdrant-aarch64-apple-darwin
+chmod +x bin/qdrant
+
+# macOS amd64 (Intel)
+curl -L -o bin/qdrant https://github.com/qdrant/qdrant/releases/download/v1.12.4/qdrant-x86_64-apple-darwin
+chmod +x bin/qdrant
+
+# Linux amd64
+curl -L -o bin/qdrant https://github.com/qdrant/qdrant/releases/download/v1.12.4/qdrant-x86_64-unknown-linux-gnu.tar.gz
+tar xzf qdrant-x86_64-unknown-linux-gnu.tar.gz -C bin/
+chmod +x bin/qdrant
+
+# Linux arm64 (树莓派 / ARM 服务器)
+curl -L -o bin/qdrant https://github.com/qdrant/qdrant/releases/download/v1.12.4/qdrant-aarch64-unknown-linux-gnu.tar.gz
+tar xzf qdrant-aarch64-unknown-linux-gnu.tar.gz -C bin/
+chmod +x bin/qdrant
+```
+
+> 版本号 `v1.12.4` 替换为最新版即可：[查看所有 release](https://github.com/qdrant/qdrant/releases/latest)
+
+**Docker 备选（可选，与 start.sh 互斥）**：如果你的环境只能跑容器，可以手动用 Docker 启动 Qdrant——但 `start.sh` 里已经带了"检测 6333 端口再决定是否拉起 qdrant"的逻辑，所以两种方式不会冲突：
+
+```bash
+# 手动 Docker 启动 Qdrant（之后再跑 ./start.sh，它会检测到 6333 已就绪，只起 vi）
+docker run -d --name vi-qdrant \
+  -p 6333:6333 -p 6334:6334 \
+  -v $(pwd)/data/qdrant:/qdrant/storage \
+  qdrant/qdrant:v1.12.4
+```
 
 ### 2. 启动
 
 ```bash
 cd vi/
 ./start.sh
-./impt.sh "/Users/51pwn/Documents/M_T_X/婚礼" "婚礼照片"
-# → 自动编译 Go 源码 → 启动 Qdrant (6333) → 启动 vi (8688)
+# → 首次运行自动 patch gocv（OpenCV 4.11+ 兼容）→ 编译 Go 源码 → 启动 Qdrant (6333) → 启动 vi (8688)
 # → 浏览器打开 http://127.0.0.1:8688
 ```
 
@@ -193,17 +245,34 @@ cd vi/
 
 1. 打开浏览器访问 `http://127.0.0.1:8688`
 2. 允许摄像头 + 定位权限
-3. 页面一打开即后台**异步预加载所有模型**（~6s），不用等点"启动"
-4. 点击「启动摄像头」开始采集
-5. 看到目标进入画面 → 自动对齐、推理、上传、入库
+3. **iOS 13+**：首次点击"启动"时弹出方向传感器授权弹窗，点允许即可启用相机方向
+4. 页面一打开即后台**异步预加载所有模型**（~6s），不用等点"启动"
+5. 点击「启动摄像头」开始采集
+6. 看到目标进入画面 → 自动对齐、推理、上传、入库
+7. 采集卡片底部会显示**海拔**和**方位**（如 `海拔 45m · 方向 东北`）
 
-### 4. 打标签 + 鸣叫
+### 4. 批量导入本地照片（一次性建人脸库）
+
+```bash
+# 扫描 ~/Photos/婚礼 目录递归所有照片
+# 自动：检测人脸 → 提 ArcFace 特征 → 解析 EXIF GPS/海拔/方向/时间 → 逆地理得中文地址 → 入库
+./impt.sh ~/Photos/婚礼 "婚礼"
+# 等价于：./bin/vi importfaces -dir ~/Photos/婚礼 -label 婚礼
+
+# dry-run：只扫描+检测，不上传 Qdrant
+./bin/vi importfaces -dir ~/Photos/婚礼 -dry-run
+
+# 强制重新导入（忽略已有 person_id）
+./bin/vi importfaces -dir ~/Photos/婚礼 -force
+```
+
+### 5. 打标签 + 鸣叫
 
 - 在「实时监测」或「检索」页面，点图片查看详情 → 「打标签」
 - 勾选「命中后鸣叫」→ 下次同一人 / 车牌出现时浏览器蜂鸣 2 次
 - 也可在「标签」页面直接管理所有标签
 
-### 5. 停止
+### 6. 停止
 
 ```bash
 ./stop.sh
@@ -226,7 +295,8 @@ cd vi/
 | `VI_PLATE_COLLECTION` | `vi_plates` | 车牌向量集合名 |
 | `VI_FACE_THRESHOLD` | `0.45` | 同一人脸余弦相似度阈值 |
 | `VI_COOLDOWN_SECONDS` | `60` | 同一身份重复入库冷却时间 |
-| `VI_GEOCODE_URL` | `https://api.bigdatacloud.net/...` | 逆地理编码接口 |
+| `VI_GEOCODE_URL` | 高德 API 或 Open-Meteo 备用 | 逆地理编码接口 |
+| `QuietShield` | 空 | 高德 Web Service Key（国内坐标准确）；留空则用 Open-Meteo 免 key |
 | `VI_SUMMARY_AT` | `23:50` | 每日总结生成时间 HH:MM |
 | `VI_TZ` | `Asia/Shanghai` | 时区 |
 
@@ -262,7 +332,9 @@ cd vi/
 |---|---|---|
 | `kind` | string | `face` 或 `plate` |
 | `captured_at` | string | ISO 时间戳 |
-| `lat`, `lon` | string | 可选，GPS 坐标 |
+| `lat`, `lon` | string | 可选，GPS 坐标（WGS-84 浏览器坐标，后端转 GCJ-02 + 逆地理） |
+| `altitude` | string | 可选，海拔米数（来自 `navigator.geolocation.coords.altitude`） |
+| `heading` | string | 可选，相机方向角度（0=北，90=东；来自 `DeviceOrientationEvent.webkitCompassHeading`） |
 | `vector` | string | 人脸时必填，`[float, ...]` JSON（512 维） |
 | `gender` / `age_range` / `glasses` | string | 人脸属性（可选） |
 | `plate_text` / `plate_conf` | string | 车牌时必填 |
@@ -402,7 +474,11 @@ POST /api/admin/reset  # 清空所有事件 / 标签 / 告警 / 向量 / 图片
   "glasses": "yes",           // 可选
   "captured_at": "2026-11-05T10:30:00+08:00",
   "address": "北京市 朝阳区 ...",
-  "image": "2026/11/05/face-xxx.jpg"
+  "image": "2026/11/05/face-xxx.jpg",
+  "lat": 39.9042,             // GCJ-02 火星坐标（WGS-84 转换后）
+  "lon": 116.4074,
+  "altitude": 45.2,           // 可选，海拔（米）
+  "heading": 45.0             // 可选，相机方向角度（0=北, 90=东）
 }
 ```
 
@@ -413,7 +489,11 @@ POST /api/admin/reset  # 清空所有事件 / 标签 / 告警 / 向量 / 图片
   "plate": "京A12345",
   "captured_at": "2026-11-05T10:30:00+08:00",
   "address": "北京市 朝阳区 ...",
-  "image": "2026/11/05/plate-xxx.jpg"
+  "image": "2026/11/05/plate-xxx.jpg",
+  "lat": 39.9042,
+  "lon": 116.4074,
+  "altitude": 45.2,
+  "heading": 45.0
 }
 ```
 
@@ -535,29 +615,44 @@ sudo systemctl enable vi
 sudo systemctl start vi
 ```
 
-### Docker（可选）
+### Docker（vi 本身**不推荐** Docker 化，Qdrant 可独立容器）
 
-项目本身不依赖任何系统库（纯 Go + 前端静态文件 + Qdrant）。Qdrant 官方有镜像，vi 可多阶段构建：
+vi 后端依赖 gocv（CGO + OpenCV 4），Docker 镜像需额外安装 libopencv-dev，体积大且构建慢。**推荐组合**：
 
-```dockerfile
-FROM golang:1.22-alpine AS build
-WORKDIR /src
-COPY go.mod .
-RUN go mod download
-COPY . .
-RUN CGO_ENABLED=0 go build -o /out/vi .
+- **vi** → 裸进程 `./start.sh` 或 systemd（见上方）
+- **Qdrant** → 如需隔离环境，单独用 Docker 起（vi 检测到 6333 已占用就不会重复拉起）
 
-FROM alpine:3.19
-RUN apk add --no-cache ca-certificates tzdata
-COPY --from=build /out/vi /usr/local/bin/vi
-COPY web /app/web
-COPY models /app/models
-WORKDIR /app
-EXPOSE 8688
-CMD ["vi", "-addr", "0.0.0.0:8688"]
+```bash
+# 仅 Qdrant 容器化，vi 裸进程
+docker run -d --name vi-qdrant \
+  --restart unless-stopped \
+  -p 6333:6333 -p 6334:6334 \
+  -v /opt/vi/data/qdrant:/qdrant/storage \
+  qdrant/qdrant:v1.12.4
+
+# vi 仍用 start.sh / systemd 跑
+./start.sh   # → 检测 6333 已就绪，只起 vi
 ```
 
-> 注意：`models/` 和 `bin/qdrant` 需要另行挂载或打包。
+> 如果一定要把 vi 也塞进 Docker，需要在基础镜像里装 OpenCV：
+> ```dockerfile
+> FROM golang:1.22-bookworm AS build
+> RUN apt-get update && apt-get install -y libopencv-dev pkg-config
+> WORKDIR /src
+> COPY go.mod go.sum ./ && go mod download
+> COPY . .
+> RUN go build -o /out/vi .
+> 
+> FROM debian:bookworm-slim
+> RUN apt-get update && apt-get install -y libopencv-dev ca-certificates tzdata && rm -rf /var/lib/apt/lists/*
+> COPY --from=build /out/vi /usr/local/bin/vi
+> COPY web /app/web
+> COPY models /app/models
+> WORKDIR /app
+> EXPOSE 8688
+> CMD ["vi", "serve", "-addr", "0.0.0.0:8688", "-qdrant", "http://host.docker.internal:6333"]
+> ```
+> 注意：CGO_ENABLED 必须保留，vi 不是纯 Go 项目。
 
 ---
 
@@ -716,6 +811,9 @@ sh startAllSs.sh stop
 | proxy 模式 Tensor ArrayBuffer 被 detach | 并发推理会炸 | 每个模型独立 `cloneTensor()` |
 | 属性模型 WASM 单线程极慢（~8s/张） | 画面卡顿 | proxy + 4 线程后主线程 maxGap < 100 ms |
 | `INT8` 动态量化 Conv 层生成 `ConvInteger` | ORT 不支持，直接报错 | 已删除所有 INT8 模型，统一 FP32 |
+| **iOS 13+ 方向传感器需要用户授权** | Safari 在用户手势（click）里调用 `DeviceOrientationEvent.requestPermission()` 才能拿到 `webkitCompassHeading` | 首次启动时自动弹窗，允许即可；Android/Chrome 无需授权 |
+| **EXIF GPSImgDirection 并非所有相机都写** | 部分卡片机/手机拍的 JPEG 没有方向字段 | 缺失时 `heading` 字段跳过，不影响其他信息入库 |
+| **GDPR 保护的位置数据（欧盟用户）** | 部分 iOS Safari 默认不给出 GPS 精确坐标 | 可用定位权限弹窗里手动允许"精确位置"，或降级为城市级逆地理 |
 
 ### 存储增长
 

@@ -116,9 +116,9 @@ h2 { font-size: 14px; margin: 0 0 8px; color: var(--text); }
   position: absolute; inset: 0; display: grid; place-items: center;
   color: var(--muted); text-align: center; padding: 20px;
 }
-/* stage 右上角浮动状态层：chipCamera + liveMsg，不占布局空间 */
+/* stage 左上角浮动状态层：chipCamera + liveMsg（第一行） */
 .stage-hud {
-  position: absolute; top: 8px; right: 8px; z-index: 10;
+  position: absolute; top: 8px; left: 8px; z-index: 10;
   display: flex; align-items: center; gap: 6px;
   padding: 4px 8px;
   background: rgba(0,0,0,0.55);
@@ -127,12 +127,26 @@ h2 { font-size: 14px; margin: 0 0 8px; color: var(--text); }
   font-size: 11px;
   color: #eee;
   pointer-events: none;  /* 不挡鼠标事件 */
+  max-width: calc(100% - 16px);
 }
-.stage-hud .chip { background: transparent; border-color: rgba(255,255,255,0.3); color: #fff; }
+.stage-hud .chip { background: transparent; border-color: rgba(255,255,255,0.3); color: #fff; flex-shrink: 0; }
 .stage-hud .muted { color: rgba(255,255,255,0.8); }
-/* 手机端 hud 小一点 */
+/* 第二行：地址/方向/海拔，紧贴第一行下方，靠左，独立一行，允许完整显示 */
+.stage-geo-hud {
+  top: 32px;              /* 第一行 top:8px + padding + 行高 ≈ 24px */
+  flex-wrap: nowrap;
+  white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis;
+  font-size: 10.5px;
+  background: rgba(0,0,0,0.45);
+  border-radius: 12px;
+  padding: 3px 7px;
+  max-width: calc(100% - 16px);
+}
+/* 手机端 hud 更紧凑 */
 @media (max-width: 600px) {
-  .stage-hud { top: 6px; right: 6px; padding: 3px 6px; font-size: 10px; gap: 4px; }
+  .stage-hud { top: 6px; left: 6px; padding: 3px 6px; font-size: 10px; gap: 4px; }
+  .stage-geo-hud { top: 26px; font-size: 9.5px; padding: 2px 5px; }
 }
 
 .toolbar { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; margin-top: 6px; flex-shrink: 0; }

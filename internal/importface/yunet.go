@@ -1,5 +1,3 @@
-//go:build importface
-
 package importface
 
 import (

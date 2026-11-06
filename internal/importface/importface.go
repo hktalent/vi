@@ -1,5 +1,3 @@
-//go:build importface
-
 package importface
 
 import (
@@ -16,6 +14,7 @@ import (
 	"gocv.io/x/gocv"
 
 	"vi/internal/config"
+	"vi/internal/exif"
 	"vi/internal/qdrant"
 	"vi/internal/store"
 )
@@ -155,6 +154,9 @@ func (im *Importer) processImage(path string) (int, error) {
 	}
 	defer img.Close()
 
+	// 解析 EXIF：GPS 经纬度/海拔/相机方向/创建时间
+	exifInfo := exif.Parse(path)
+
 	// 人脸检测：YuNet（DNN，输出原图坐标）优先；否则 Haar cascade（输出缩放图坐标）
 	detectScale := 1.0
 	var rects []image.Rectangle
@@ -291,7 +293,22 @@ func (im *Importer) processImage(path string) (int, error) {
 
 		if im.st != nil {
 			// 通过 Store 统一写入：Event（前端可见） + Qdrant（向量搜索）
-			if _, err := im.st.ImportFace(personID, embedding, rel, path, time.Now().In(im.cfg.Location)); err != nil {
+			capturedAt := exifInfo.CreatedAt
+			if capturedAt.IsZero() {
+				capturedAt = time.Now()
+			}
+			capturedAt = capturedAt.In(im.cfg.Location)
+			if _, err := im.st.ImportFace(store.ImportFaceInput{
+				PersonID:   personID,
+				Vector:     embedding,
+				ImagePath:  rel,
+				SourcePath: path,
+				CapturedAt: capturedAt,
+				Lat:        exifInfo.Latitude,
+				Lon:        exifInfo.Longitude,
+				Altitude:   exifInfo.Altitude,
+				Heading:    exifInfo.Heading,
+			}); err != nil {
 				log.Printf("[import] ImportFace 失败: %v", err)
 				continue
 			}

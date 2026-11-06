@@ -1,3 +1,7 @@
+# github.com/rwcarlsen/goexif v0.0.0-20190401172101-9e8deecbddbd
+## explicit
+github.com/rwcarlsen/goexif/exif
+github.com/rwcarlsen/goexif/tiff
 # gocv.io/x/gocv v0.38.0 => ./.build/gocv
 ## explicit; go 1.21
 gocv.io/x/gocv

@@ -29,7 +29,9 @@ type Event struct {
 	Lat        *float64  `json:"lat,omitempty"`
 	Lon        *float64  `json:"lon,omitempty"`
 	Address    string    `json:"address"`
-	Image      string    `json:"image"` // 相对 data/images 的路径
+	Altitude   *float64  `json:"altitude,omitempty"` // 海拔（米）
+	Heading    *float64  `json:"heading,omitempty"`  // 相机方向角度（0=北, 90=东）
+	Image      string    `json:"image"`              // 相对 data/images 的路径
 	PlateText  string    `json:"plate_text,omitempty"`
 	PlateConf  float64   `json:"plate_conf,omitempty"`
 	PersonID   string    `json:"person_id"`
@@ -183,6 +185,8 @@ type CaptureInput struct {
 	Kind       string
 	CapturedAt time.Time
 	Lat, Lon   *float64
+	Altitude   *float64 // 海拔（米）
+	Heading    *float64 // 相机方向角度（0=北, 90=东）
 	Vector     []float32
 	PlateText  string
 	PlateConf  float64
@@ -250,6 +254,8 @@ func (s *Store) Capture(in CaptureInput) (*CaptureResult, error) {
 		Lat:        gcjLat,
 		Lon:        gcjLon,
 		Address:    addr,
+		Altitude:   in.Altitude,
+		Heading:    in.Heading,
 		Image:      in.ImagePath,
 		PlateText:  in.PlateText,
 		PlateConf:  in.PlateConf,
@@ -278,6 +284,12 @@ func (s *Store) Capture(in CaptureInput) (*CaptureResult, error) {
 		"image":       e.Image,
 		"lat":         e.Lat,
 		"lon":         e.Lon,
+	}
+	if e.Altitude != nil {
+		payload["altitude"] = *e.Altitude
+	}
+	if e.Heading != nil {
+		payload["heading"] = *e.Heading
 	}
 	if e.Kind == "plate" {
 		payload["plate"] = e.PlateText
@@ -340,15 +352,46 @@ func (s *Store) appendEvents(e *Event) error {
 	return err
 }
 
+// ImportFaceInput 批量导入单张人脸所需的字段。
+type ImportFaceInput struct {
+	PersonID   string
+	Vector     []float32
+	ImagePath  string    // 抠图相对路径
+	SourcePath string    // 原始图片路径（EXIF 解析时用）
+	CapturedAt time.Time // 事件时间（EXIF 创建时间优先，回退 time.Now）
+	Lat        *float64  // WGS-84 纬度（来自 EXIF GPS）
+	Lon        *float64  // WGS-84 经度
+	Altitude   *float64  // 海拔（米）
+	Heading    *float64  // 相机方向角度（0=北, 90=东）
+}
+
 // ImportFace 直接写入一条人脸事件 + upsert Qdrant，跳过同一性搜索和 cooldown。
 // 用于批量导入场景（importfaces），导入时不需要搜索匹配，直接插入即可。
-func (s *Store) ImportFace(personID string, vec []float32, imagePath, sourcePath string, capturedAt time.Time) (*Event, error) {
+// 如果 in.Lat/in.Lon 非空，会做逆地理编码得到地址。
+func (s *Store) ImportFace(in ImportFaceInput) (*Event, error) {
+	var gcjLat, gcjLon *float64
+	addr := ""
+	if in.Lat != nil && in.Lon != nil {
+		addr = s.geo.Reverse(in.Lat, in.Lon)
+		g, l := geo.WGS84ToGCJ02(*in.Lon, *in.Lat)
+		gcjLat, gcjLon = &g, &l
+	}
+
+	if in.CapturedAt.IsZero() {
+		in.CapturedAt = time.Now()
+	}
+
 	e := &Event{
 		ID:         newID(),
 		Kind:       "face",
-		CapturedAt: capturedAt,
-		Image:      imagePath,
-		PersonID:   personID,
+		CapturedAt: in.CapturedAt,
+		Lat:        gcjLat,
+		Lon:        gcjLon,
+		Address:    addr,
+		Altitude:   in.Altitude,
+		Heading:    in.Heading,
+		Image:      in.ImagePath,
+		PersonID:   in.PersonID,
 		CreatedAt:  time.Now(),
 	}
 	s.mu.Lock()
@@ -362,9 +405,22 @@ func (s *Store) ImportFace(personID string, vec []float32, imagePath, sourcePath
 		"person_id":   e.PersonID,
 		"captured_at": e.CapturedAt.Format(time.RFC3339),
 		"image":       e.Image,
-		"source_path": sourcePath,
+		"source_path": in.SourcePath,
 	}
-	if err := s.qd.UpsertFace(e.ID, vec, payload); err != nil {
+	if addr != "" {
+		payload["address"] = addr
+	}
+	if e.Lat != nil {
+		payload["lat"] = e.Lat
+		payload["lon"] = e.Lon
+	}
+	if e.Altitude != nil {
+		payload["altitude"] = *e.Altitude
+	}
+	if e.Heading != nil {
+		payload["heading"] = *e.Heading
+	}
+	if err := s.qd.UpsertFace(e.ID, in.Vector, payload); err != nil {
 		return e, fmt.Errorf("upsert face: %w", err)
 	}
 	return e, nil
@@ -507,6 +563,14 @@ func (s *Store) Labels() []*Label {
 	out := make([]*Label, len(s.labels))
 	copy(out, s.labels)
 	return out
+}
+
+// Reverse 把 WGS-84 经纬度做逆地理编码（带本地缓存）。
+func (s *Store) Reverse(lat, lon *float64) string {
+	if s == nil || s.geo == nil || lat == nil || lon == nil {
+		return ""
+	}
+	return s.geo.Reverse(lat, lon)
 }
 
 // QDEnsure 触发 Qdrant Ensure（健康检查用）。
