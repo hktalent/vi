@@ -56,7 +56,7 @@ func loadConfig() config.Config {
 	flag.StringVar(&c.QdrantURL, "qdrant", env("VI_QDRANT", "http://127.0.0.1:6333"), "Qdrant 地址")
 	flag.StringVar(&c.FaceCol, "face-collection", env("VI_FACE_COLLECTION", "vi_faces"), "人脸向量集合")
 	flag.StringVar(&c.PlateCol, "plate-collection", env("VI_PLATE_COLLECTION", "vi_plates"), "车牌向量集合")
-	th := env("VI_FACE_THRESHOLD", "0.45")
+	th := env("VI_FACE_THRESHOLD", "0.52")
 	flag.Float64Var(&c.FaceThresh, "face-threshold", mustFloat(th), "同一人脸判定阈值(余弦相似度)")
 	cd := env("VI_COOLDOWN_SECONDS", "60")
 	flag.DurationVar(&c.Cooldown, "cooldown", time.Duration(mustInt(cd))*time.Second, "同一目标重复入库冷却时间")

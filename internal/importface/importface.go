@@ -2,6 +2,7 @@ package importface
 
 import (
 	"crypto/md5"
+	"crypto/rand"
 	"fmt"
 	"image"
 	"io"
@@ -34,10 +35,52 @@ type Importer struct {
 	net         *gocv.Net
 	label      string // 可选标签，作为每张新脸的 PersonID 前缀
 	dryRun     bool
-	force      bool              // 强制重新导入（忽略已有记录）
-	existing   map[string]bool   // 已导入的 person_id 集合（幂等去重）
-	skipped    int               // 跳过数量统计
-	filtered   int               // 被 norm 过滤丢弃的数量统计
+	force       bool              // 强制重新导入（忽略已有记录）
+	faceThresh  float64           // 人脸相似度阈值（Qdrant 搜索用，保持 0.45 召回率优先）
+	batchThresh float64           // 批次内同人匹配阈值（更高，避免不同人被错误合并）
+	existing    map[string]bool   // 已导入的 person_id 集合（幂等去重）
+	seen        []seenFace        // 本次 Run 内已见过的人脸向量+personID（批次内同人去重）
+	skipped     int               // 跳过数量统计
+	filtered    int               // 被 norm / 侧脸 / 五官不全过滤丢弃的数量统计
+}
+
+// seenFace 批次内已见过的一张脸，用于 Run 循环中的同人去重。
+type seenFace struct {
+	personID string
+	vec      []float32
+}
+
+// cosine 算两个 512 维向量的余弦相似度。
+func cosine(a, b []float32) float64 {
+	var dot, na, nb float64
+	for i := range a {
+		dot += float64(a[i]) * float64(b[i])
+		na += float64(a[i]) * float64(a[i])
+		nb += float64(b[i]) * float64(b[i])
+	}
+	if na == 0 || nb == 0 {
+		return 0
+	}
+	return dot / (math.Sqrt(na) * math.Sqrt(nb))
+}
+
+// matchBatch 在本次导入的 seen 列表里找最相似的 personID，相似度 ≥ batchThresh 才返回。
+// 批次内用更高阈值（0.58），避免不同人在光线/角度相近时 cosine 刚好 ≥ 0.45 被错误合并。
+// ArcFace 余弦相似度典型分布：同人 0.65~0.92，不同人 0.25~0.48。
+func (im *Importer) matchBatch(vec []float32) (string, float64) {
+	var bestID string
+	var bestScore float64
+	for _, s := range im.seen {
+		score := cosine(vec, s.vec)
+		if score > bestScore {
+			bestScore = score
+			bestID = s.personID
+		}
+	}
+	if bestScore >= im.batchThresh {
+		return bestID, bestScore
+	}
+	return "", bestScore
 }
 
 // NewImporter 创建 Importer。
@@ -45,7 +88,17 @@ type Importer struct {
 // cascadeXML 是 OpenCV Haar cascade 路径（YuNet 缺失时的回退检测器），arcOnnx 是 arc.onnx 路径（提取 embedding 用）。
 // force=true 时忽略已有导入记录，全部重新导入。
 func NewImporter(cfg config.Config, qd *qdrant.Qdrant, st *store.Store, cascadeXML, arcOnnx, yunetPath, label string, dryRun, force bool) (*Importer, error) {
-	im := &Importer{cfg: cfg, qd: qd, st: st, label: label, dryRun: dryRun, force: force}
+	im := &Importer{
+		cfg:         cfg,
+		qd:          qd,
+		st:          st,
+		label:       label,
+		dryRun:      dryRun,
+		force:       force,
+		faceThresh:  cfg.FaceThresh,
+		batchThresh: 0.58, // 批次内更严格阈值（ArcFace 同人 ≥ 0.65，不同人 ≤ 0.48，0.58 是安全分界）
+		seen:        []seenFace{},
+	}
 
 	// 检测器：优先 YuNet（DNN，准确率高且输出 5 点关键点）；加载失败回退 Haar cascade
 	if yunetPath != "" {
@@ -57,13 +110,14 @@ func NewImporter(cfg config.Config, qd *qdrant.Qdrant, st *store.Store, cascadeX
 		}
 	}
 
+	cascadeDir := filepath.Dir(cascadeXML)
+
 	if im.yunet == nil {
 		cc := gocv.NewCascadeClassifier()
 		if !cc.Load(cascadeXML) {
 			return nil, fmt.Errorf("加载 Haar cascade 失败: %s", cascadeXML)
 		}
-		// 加载第二、第三投票 cascade（同目录）
-		cascadeDir := filepath.Dir(cascadeXML)
+		// 加载第二、第三投票 cascade
 		ccAlt := gocv.NewCascadeClassifier()
 		if !ccAlt.Load(filepath.Join(cascadeDir, "haarcascade_frontalface_alt.xml")) {
 			log.Printf("[import] ⚠️  alt cascade 加载失败，投票降级为单 cascade")
@@ -72,19 +126,27 @@ func NewImporter(cfg config.Config, qd *qdrant.Qdrant, st *store.Store, cascadeX
 		if !ccAlt2.Load(filepath.Join(cascadeDir, "haarcascade_frontalface_alt2.xml")) {
 			log.Printf("[import] ⚠️  alt2 cascade 加载失败，投票降级为单 cascade")
 		}
-		// 从 face cascade 路径推导 eye/mouth cascade 路径（同目录）
-		eyeXML := filepath.Join(cascadeDir, "haarcascade_eye.xml")
-		ec := gocv.NewCascadeClassifier()
-		if !ec.Load(eyeXML) {
-			return nil, fmt.Errorf("加载 eye cascade 失败: %s", eyeXML)
-		}
+		// mouth cascade 仅 Haar 路径需要
 		mouthXML := filepath.Join(cascadeDir, "haarcascade_smile.xml")
 		mc := gocv.NewCascadeClassifier()
 		if !mc.Load(mouthXML) {
 			return nil, fmt.Errorf("加载 mouth cascade 失败: %s", mouthXML)
 		}
-		im.cascade, im.cascadeAlt, im.cascadeAlt2, im.eyeCascade, im.mouthCascade = &cc, &ccAlt, &ccAlt2, &ec, &mc
+		im.cascade, im.cascadeAlt, im.cascadeAlt2, im.mouthCascade = &cc, &ccAlt, &ccAlt2, &mc
 	}
+
+	// ✅ eye cascade 两种模式都要加载：
+	//   - YuNet 模式：用来验证 YuNet 给的眼睛 landmark 附近真的有睁开的眼睛（闭眼时眼皮缝 cascade 检不出）
+	//   - Haar 模式：hasFacialFeatures 里用
+	eyeXML := filepath.Join(cascadeDir, "haarcascade_eye_tree_eyeglasses.xml")
+	if _, err := os.Stat(eyeXML); err != nil {
+		eyeXML = filepath.Join(cascadeDir, "haarcascade_eye.xml")
+	}
+	ec := gocv.NewCascadeClassifier()
+	if !ec.Load(eyeXML) {
+		return nil, fmt.Errorf("加载 eye cascade 失败: %s", eyeXML)
+	}
+	im.eyeCascade = &ec
 
 	net := gocv.ReadNetFromONNX(arcOnnx)
 	if net.Empty() {
@@ -147,16 +209,13 @@ func (im *Importer) Run(dir string) (int, error) {
 	return success, nil
 }
 
-// processImage 处理一张图片：检测所有人脸，逐一提取 embedding + upsert。
+// processImage 处理一张图片：检测所有人脸 → embedding 去重 → 保存。
 func (im *Importer) processImage(path string) (int, error) {
 	img := gocv.IMRead(path, gocv.IMReadColor)
 	if img.Empty() {
 		return 0, fmt.Errorf("无法读取")
 	}
 	defer img.Close()
-
-	// 算文件内容 MD5 前缀（前 8 位 hex）——跨目录同内容图片（即使文件路径/文件名完全不同）也能命中去重
-	contentHash := fileMD5Short(path)
 
 	// 解析 EXIF：GPS 经纬度/海拔/相机方向/创建时间
 	exifInfo := exif.Parse(path)
@@ -192,17 +251,9 @@ func (im *Importer) processImage(path string) (int, error) {
 
 	saved := 0
 	for i, r := range rects {
-		// 幂等检查：personID 以文件内容 MD5 为核心，同一张图同一张脸不管在哪个目录都生成相同 personID
-		personID := newPersonID(im.label, contentHash, i)
-		if !im.force && im.existing != nil && im.existing[personID] {
-			im.skipped++
-			continue
-		}
-
-		// YuNet 模式下用 5 点关键点做侧脸 / 五官不全过滤
+		// YuNet 模式下用 score + 5 点关键点 + Haar eye cascade 三重验证五官完整性 + 睁眼
 		if im.yunet != nil && i < len(yuFaces) {
-			// YuNet 的 bbox 本身就是原图坐标，detectScale=1.0，直接用
-			if !isFrontalFace(yuFaces[i], img.Cols(), img.Rows()) {
+			if !im.isQualityFace(yuFaces[i], img) {
 				im.filtered++
 				continue
 			}
@@ -240,11 +291,9 @@ func (im *Importer) processImage(path string) (int, error) {
 		cropRect := image.Rect(x, y, x2, y2)
 		crop := img.Region(cropRect)
 
-		// 以下三处启发式过滤只为弥补 Haar 的高误检率；
-		// YuNet 是 DNN 检测器且输出关键点，误检率极低，跳过这些检查（保留 embedding norm 过滤）。
+		// Haar 级联启发式过滤（YuNet 是 DNN 检测器，跳过这三步检查）
 		if im.yunet == nil {
-			// 多 cascade 投票：alt/alt2 cascade 也检测一下，至少 2/3 通过才保留
-			votes := 1 // 主 cascade 已投 1 票
+			votes := 1
 			if im.cascadeAlt != nil {
 				altRects := im.cascadeAlt.DetectMultiScaleWithParams(crop, 1.1, 4, 0, image.Pt(20, 20), image.Pt(0, 0))
 				if len(altRects) > 0 {
@@ -262,16 +311,11 @@ func (im *Importer) processImage(path string) (int, error) {
 				crop.Close()
 				continue
 			}
-
-			// 肤色检测：人脸包含一定比例的肤色像素，非人脸（纯白/纯黑/纹理）没有
 			if !hasSkinTone(crop) {
 				im.filtered++
 				crop.Close()
 				continue
 			}
-
-			// 面部特征几何验证：水平成对的眼睛，或眼睛+嘴巴的正确位置关系。
-			// 领带/花朵/布料的纹理误检无法通过几何约束。
 			if !im.hasFacialFeatures(crop) {
 				im.filtered++
 				crop.Close()
@@ -294,11 +338,41 @@ func (im *Importer) processImage(path string) (int, error) {
 			continue
 		}
 
+		// ✅ personID 决策链（embedding 相似度优先，两处都用 batchThresh 严格阈值）：
+		// 1. 批次内已见过（同目录前面图片已识别）→ 复用已有 personID（batchThresh 0.58）
+		// 2. Qdrant 里已有（之前批次导入过）→ 复用已有 personID（同样用 batchThresh，避免跨批次误合并）
+		// 3. 都没见过 → 新生成 import_{label}_{uuid8}
+		var personID string
+		if pid, score := im.matchBatch(embedding); pid != "" {
+			personID = pid
+			log.Printf("[import] 批次内同人复用 personID=%s (sim=%.3f)", personID, score)
+		} else if im.qd != nil {
+			// 也用 batchThresh（0.58），比 cfg.FaceThresh（0.45）严格，避免跨批次不同人被误合并
+			if hit, err := im.qd.SearchFace(embedding, im.batchThresh); err == nil && hit.ID != "" {
+				if pid, ok := hit.Payload["person_id"].(string); ok && pid != "" {
+					personID = pid
+					log.Printf("[import] Qdrant 命中已有人 personID=%s (sim=%.3f)", personID, hit.Score)
+				}
+			}
+		}
+		if personID == "" {
+			personID = newPersonID(im.label)
+		}
+
 		// 保存抠图
-		rel, err := im.saveFaceCrop(path, personID, crop)
+		rel, err := im.saveFaceCrop(personID, crop)
 		crop.Close()
 		if err != nil {
 			log.Printf("[import] 保存抠图失败: %v", err)
+		}
+
+		// 记录到批次 seen 列表，后续同人匹配用
+		im.seen = append(im.seen, seenFace{personID: personID, vec: embedding})
+
+		// ImportFace 的 existing 检查：personID 已存在（-force 模式）→ 跳过
+		if !im.force && im.existing != nil && im.existing[personID] {
+			im.skipped++
+			continue
 		}
 
 		if im.dryRun {
@@ -307,7 +381,6 @@ func (im *Importer) processImage(path string) (int, error) {
 		}
 
 		if im.st != nil {
-			// 通过 Store 统一写入：Event（前端可见） + Qdrant（向量搜索）
 			capturedAt := exifInfo.CreatedAt
 			if capturedAt.IsZero() {
 				capturedAt = time.Now()
@@ -328,8 +401,6 @@ func (im *Importer) processImage(path string) (int, error) {
 				continue
 			}
 		} else {
-			// 无 Store（dry-run 或独立模式）：只写 Qdrant
-			// 用 personID 做 point ID：重复运行覆盖同 person 向量（幂等）
 			payload := map[string]any{
 				"kind":        "face",
 				"person_id":   personID,
@@ -434,22 +505,12 @@ func matToFloat32(m gocv.Mat) ([]float32, error) {
 }
 
 // saveFaceCrop 把人脸抠图落盘到 data/images/import/ 目录。
-// 文件名基于 personID（确定性），同一张图同一张脸多次运行生成相同文件名，不会重复保存。
-// 路径：images/import/personID.jpg（扁平结构，import 的 personID 已含文件内容 MD5）。
-func (im *Importer) saveFaceCrop(srcPath string, personID string, crop gocv.Mat) (string, error) {
-	ext := strings.ToLower(filepath.Ext(srcPath))
-	switch ext {
-	case ".jpeg", ".webp", ".heic", "":
-		ext = ".jpg"
-	}
-	rel := filepath.Join("import", personID+ext)
+// 文件名只看 personID → 同人多次落盘直接覆盖，磁盘上永远是最后一次采集的最新版本。
+func (im *Importer) saveFaceCrop(personID string, crop gocv.Mat) (string, error) {
+	rel := filepath.Join("import", personID+".jpg")
 	full := filepath.Join(im.cfg.DataDir, "images", rel)
 	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
 		return "", err
-	}
-	// 文件已存在 → 跳过（幂等）
-	if _, err := os.Stat(full); err == nil {
-		return rel, nil
 	}
 	target := gocv.NewMat()
 	gocv.Resize(crop, &target, image.Pt(160, 160), 0, 0, gocv.InterpolationLinear)
@@ -470,12 +531,21 @@ func (im *Importer) writeFacesLog(path string, n int) {
 	log.Printf("[import] %s → %d 张人脸", filepath.Base(path), n)
 }
 
-func newPersonID(label, contentHash string, idx int) string {
+func newPersonID(label string) string {
 	base := "import"
 	if label != "" {
 		base = sanitize(label)
 	}
-	return fmt.Sprintf("import_%s_%s_%d", base, contentHash, idx)
+	return fmt.Sprintf("import_%s_%s", base, uuidShort())
+}
+
+// uuidShort 生成短 UUID（前 8 位 hex）。
+func uuidShort() string {
+	var b [4]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "00000000"
+	}
+	return fmt.Sprintf("%x", b[:])
 }
 
 // fileMD5Short 读整个文件算 MD5，返回前 8 位 hex。
@@ -565,17 +635,12 @@ func hasSkinTone(crop gocv.Mat) bool {
 	return ratio >= 0.15
 }
 
-// hasFacialFeatures 用几何约束验证面部特征，过滤领带/花朵/布料等误检。
-//
-// 通过条件（任一）：
-//  1. 眼睛成对：两只眼睛水平对齐、间距合理（0.15-0.50 脸宽）、大小相近、整体居中。
-//     领带纹理的"眼睛"是竖直排列或尺寸过小（<0.07 脸宽）的噪声；
-//     玫瑰花辨的"眼睛"分布在画面边缘、间距过宽，均无法通过。
-//  2. 眼睛 + 嘴巴位置关系正确：1 只居中的眼睛 + 嘴巴在其下方。
-//     覆盖侧脸（只能看到 1 只眼睛）场景。
-//
-// 关键约束是尺寸归一化：真人眼睛宽约 0.07-0.35 脸宽，嘴巴宽约 0.15-0.60 脸宽；
-// 高分辨率图片上花纹/布料触发的误检尺寸远小于此。
+// hasFacialFeatures 用 Haar 级联矩形 + 几何约束 + 统计特征判断是否真脸。
+// 强化版本（相对旧版的 3 个关键改动）：
+//   1. MUST 有嘴巴：条件 1（成对眼睛）和条件 2（单眼）都要求 mouth cascade 命中。
+//      旧版条件 1 只要求眼睛成对就 return true → 花的两个对称花瓣没嘴巴也能蒙混 → 现在必须有嘴巴。
+//   2. 眼睛矩形宽高比 ≥ 1.5：真人眼睛是水平椭圆，花芯/纹理触发的矩形近正方形 w/h≈1.0 → reject。
+//   3. 花放射状拒：上半脸 eye cascade 返回 ≥ 5 个小框 → 花瓣对称放射触发的误检 → 直接 reject。
 func (im *Importer) hasFacialFeatures(crop gocv.Mat) bool {
 	faceW := float64(crop.Cols())
 	faceH := float64(crop.Rows())
@@ -593,39 +658,32 @@ func (im *Importer) hasFacialFeatures(crop gocv.Mat) bool {
 	defer upper.Close()
 	eyeRects := im.eyeCascade.DetectMultiScaleWithParams(upper, 1.1, 4, 0, image.Pt(10, 10), image.Pt(0, 0))
 
-	type feat struct{ x, y, w float64 }
+	// 花放射状拒：eye cascade 返回 ≥ 5 个小矩形（花瓣对称放射状结构）→ 直接 reject
+	if len(eyeRects) >= 5 {
+		return false
+	}
+
+	type feat struct{ x, y, w, h float64 }
 	eyes := make([]feat, 0, len(eyeRects))
 	for _, r := range eyeRects {
 		cx := (float64(r.Min.X) + float64(r.Dx())/2) / faceW
-		cy := (float64(r.Min.Y) + float64(r.Dy())/2) / faceH // region 从 y=0 起，无需偏移
+		cy := (float64(r.Min.Y) + float64(r.Dy())/2) / faceH
 		w := float64(r.Dx()) / faceW
-		// 尺寸 + 位置约束：过滤花纹噪声
+		h := float64(r.Dy()) / faceH
+		// 尺寸 + 位置 + 宽高比（真人眼睛水平椭圆 w/h ≥ 1.5，花芯近正方形 ≈ 1.0）
 		if w < 0.07 || w > 0.35 {
+			continue
+		}
+		if h <= 0 || w/h < 1.5 {
 			continue
 		}
 		if cy < 0.10 || cy > 0.60 || cx < 0.10 || cx > 0.90 {
 			continue
 		}
-		eyes = append(eyes, feat{cx, cy, w})
+		eyes = append(eyes, feat{cx, cy, w, h})
 	}
 
-	// 条件 1：水平成对的眼睛（间距、对齐、大小、居中）
-	for i := 0; i < len(eyes); i++ {
-		for j := i + 1; j < len(eyes); j++ {
-			dy := math.Abs(eyes[i].y - eyes[j].y)
-			dx := math.Abs(eyes[i].x - eyes[j].x)
-			centerX := (eyes[i].x + eyes[j].x) / 2
-			sizeRatio := eyes[i].w / eyes[j].w
-			if sizeRatio < 1 {
-				sizeRatio = 1 / sizeRatio
-			}
-			if dy < 0.15 && dx >= 0.15 && dx <= 0.50 && sizeRatio < 2.0 && centerX >= 0.28 && centerX <= 0.72 {
-				return true
-			}
-		}
-	}
-
-	// 2. 嘴巴检测（下 55% 区域，minNeighbors=6 抑制纹理误检）
+	// 2. 嘴巴检测（下 55% 区域，minNeighbors=8 更严格抑制布料/花纹理）
 	lowerY := int(faceH * 0.45)
 	lowerH := int(faceH) - lowerY
 	if lowerH < 10 {
@@ -634,7 +692,7 @@ func (im *Importer) hasFacialFeatures(crop gocv.Mat) bool {
 	}
 	lower := gray.Region(image.Rect(0, lowerY, int(faceW), lowerY+lowerH))
 	defer lower.Close()
-	mouthRects := im.mouthCascade.DetectMultiScaleWithParams(lower, 1.1, 6, 0, image.Pt(12, 12), image.Pt(0, 0))
+	mouthRects := im.mouthCascade.DetectMultiScaleWithParams(lower, 1.1, 8, 0, image.Pt(12, 12), image.Pt(0, 0))
 
 	mouths := make([]feat, 0, len(mouthRects))
 	for _, r := range mouthRects {
@@ -647,10 +705,34 @@ func (im *Importer) hasFacialFeatures(crop gocv.Mat) bool {
 		if cy < 0.55 || cy > 0.95 || cx < 0.28 || cx > 0.72 {
 			continue
 		}
-		mouths = append(mouths, feat{cx, cy, w})
+		mouths = append(mouths, feat{cx, cy, w, float64(r.Dy()) / faceH})
 	}
 
-	// 条件 2：1 只居中的眼睛 + 嘴巴在其下方（侧脸/单眼场景）
+	// ✅ 条件 1：水平成对的眼睛 + MUST 有嘴巴（旧版没要求嘴巴 → 花蒙混）
+	if len(eyes) >= 2 && len(mouths) >= 1 {
+		for i := 0; i < len(eyes); i++ {
+			for j := i + 1; j < len(eyes); j++ {
+				dy := math.Abs(eyes[i].y - eyes[j].y)
+				dx := math.Abs(eyes[i].x - eyes[j].x)
+				centerX := (eyes[i].x + eyes[j].x) / 2
+				centerY := (eyes[i].y + eyes[j].y) / 2
+				sizeRatio := eyes[i].w / eyes[j].w
+				if sizeRatio < 1 {
+					sizeRatio = 1 / sizeRatio
+				}
+				if dy < 0.15 && dx >= 0.15 && dx <= 0.50 && sizeRatio < 2.0 && centerX >= 0.28 && centerX <= 0.72 {
+					// 成对眼睛 + 至少一个嘴巴在两眼中点正下方 ± 0.35 水平范围
+					for _, m := range mouths {
+						if m.y-centerY > 0.15 && math.Abs(m.x-centerX) < 0.35 {
+							return true
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// ✅ 条件 2：1 只居中的眼睛 + MUST 有嘴巴（侧脸/单眼场景）
 	for _, e := range eyes {
 		if e.x < 0.30 || e.x > 0.70 {
 			continue
@@ -665,31 +747,45 @@ func (im *Importer) hasFacialFeatures(crop gocv.Mat) bool {
 	return false
 }
 
-// isFrontalFace 用 YuNet 5 点关键点判断人脸是否足够正 / 五官是否完整。
-// 5 个点顺序：右眼、左眼、鼻尖、右嘴角、左嘴角。
+// isQualityFace 用 YuNet score + 5 点关键点 + Haar eye cascade 四重验证人脸质量。
+// 5 个点顺序：右眼中心、左眼中心、鼻尖、右嘴角、左嘴角。
 //
 // 通过条件（全部满足才返回 true）：
-//  1. 双眼水平距离占脸宽 ≥ 12%：侧脸时双眼几乎叠在一起，比例会 < 10%
-//  2. 双眼垂直倾斜占脸高 ≤ 30%：正常脸双眼水平对齐，倾斜过多说明偏/晃
-//  3. 鼻尖在双眼之间（x 在 eye_left.x ~ eye_right.x 范围内）：侧脸时鼻尖会跑到眼睛一侧外面
-//  4. 嘴角 y > 鼻尖 y（嘴巴在鼻子下面）：反向说明脸可能歪到不可识别
-//  5. 所有 landmark 都在脸 bbox 内（无越界）：五官不全（比如只看到半张脸）时会有 landmark 跑出 bbox
-func isFrontalFace(f YuFace, imgW, imgH int) bool {
+//   A. YuNet Score ≥ 0.75（低质量脸 YuNet score 会降）
+//   B. 双眼水平距离 / 脸宽 ∈ [12%, 55%]（侧脸双眼叠一起 → 过小；过宽 → YuNet 检测框太窄，耳朵被裁）
+//   C. 双眼垂直倾斜 / 脸高 ≤ 30%（脸歪 → 过不了）
+//   D. 鼻尖 x ∈ 双眼区间 ± 20%（侧脸鼻尖跑眼睛外 → 过不了）
+//   E. MAR（嘴巴张合度）∈ [0.05, 0.45]（太小=闭嘴/花假 landmark，太大=假脸）
+//   F. 嘴巴水平宽度 ≥ 12% 脸宽（花的假嘴角挤在一起 → 过不了）
+//   G. 嘴巴中心 y ∈ [鼻尖+5%, 鼻尖+40%] faceH（严格在鼻子正下方）
+//   H. 所有 5 个 landmark 在脸 bbox ±5% 内
+//   I. 【闭眼拦截】双眼 landmark 附近 Haar eye cascade 必须能检测到
+//   J. 【耳朵空间】YuNet bbox 宽度 ≥ 双眼距离 × 1.8（正脸双眼间距占脸宽 ~40%，YuNet bbox 覆盖到耳朵）
+//      + 右眼角到 bbox 左边界 ≥ 15% faceW + 左眼角到 bbox 右边界 ≥ 15% faceW
+//      侧脸时 YuNet bbox 紧贴眼角 → 耳朵被裁 → 过不了
+func (im *Importer) isQualityFace(f YuFace, img gocv.Mat) bool {
+	faceW := float32(f.Rect.Dx())
+	faceH := float32(f.Rect.Dy())
+	bboxLeft := float32(f.Rect.Min.X)
+	bboxRight := float32(f.Rect.Max.X)
+
+	// A. YuNet score 门槛
+	if f.Score < 0.75 {
+		return false
+	}
+
 	lm := f.Landmarks
-	// 先确认 5 个点坐标都合理（不是 NaN、不是 0、不在图片外 5px）
 	for k := 0; k < 5; k++ {
 		x, y := lm[k][0], lm[k][1]
 		if x != x || y != y {
-			return false // NaN
+			return false
 		}
-		if x < -5 || y < -5 || x > float32(imgW+5) || y > float32(imgH+5) {
-			return false // 完全越界
+		if x < -5 || y < -5 || x > float32(img.Cols()+5) || y > float32(img.Rows()+5) {
+			return false
 		}
 	}
 
-	faceW := float32(f.Rect.Dx())
-	faceH := float32(f.Rect.Dy())
-	if faceW < 20 || faceH < 20 {
+	if faceW < 30 || faceH < 30 {
 		return false
 	}
 	rightEye := lm[0]
@@ -698,43 +794,104 @@ func isFrontalFace(f YuFace, imgW, imgH int) bool {
 	rightMouth := lm[3]
 	leftMouth := lm[4]
 
-	// 1. 双眼水平距离
+	// B. 双眼水平距离（上下限双重检查）
 	eyeDx := absF32(leftEye[0] - rightEye[0])
-	if eyeDx/faceW < 0.12 {
-		return false // 双眼太近 → 侧脸严重
-	}
-
-	// 2. 双眼垂直倾斜
-	eyeDy := absF32(leftEye[1] - rightEye[1])
-	if eyeDy/faceH > 0.30 {
-		return false // 倾斜过大
-	}
-
-	// 3. 鼻尖在双眼之间（允许少量偏移）
-	eyeMinX := minF32(leftEye[0], rightEye[0])
-	eyeMaxX := maxF32(leftEye[0], rightEye[0])
-	if nose[0] < eyeMinX-eyeDx*0.2 || nose[0] > eyeMaxX+eyeDx*0.2 {
-		return false // 鼻尖不在双眼中间 → 脸转太多
-	}
-
-	// 4. 嘴角 y 在鼻尖 y 下方（嘴巴在鼻子下，允许少量）
-	mouthAvgY := (rightMouth[1] + leftMouth[1]) / 2
-	if mouthAvgY < nose[1]-faceH*0.05 {
+	eyeDxRatio := eyeDx / faceW
+	if eyeDxRatio < 0.12 || eyeDxRatio > 0.55 {
+		// 太小=侧脸；太大=YuNet bbox 太窄，耳朵被裁掉了
 		return false
 	}
 
-	// 5. 所有 landmark 在 face bbox 内（含 5% 宽松）
-	xb := float32(f.Rect.Min.X) - faceW*0.05
-	x2b := float32(f.Rect.Max.X) + faceW*0.05
+	// C. 双眼垂直倾斜
+	eyeDy := absF32(leftEye[1] - rightEye[1])
+	if eyeDy/faceH > 0.30 {
+		return false
+	}
+
+	// D. 鼻尖在双眼之间
+	eyeMinX := minF32(leftEye[0], rightEye[0])
+	eyeMaxX := maxF32(leftEye[0], rightEye[0])
+	if nose[0] < eyeMinX-eyeDx*0.2 || nose[0] > eyeMaxX+eyeDx*0.2 {
+		return false
+	}
+
+	// E. MAR（嘴巴张合度）
+	mouthW := absF32(leftMouth[0] - rightMouth[0])
+	mouthH := absF32(leftMouth[1] - rightMouth[1])
+	if mouthW < 1 {
+		return false
+	}
+	mar := mouthH / mouthW
+	if mar < 0.05 || mar > 0.45 {
+		return false
+	}
+
+	// F. 嘴巴水平宽度 ≥ 12% 脸宽
+	if mouthW/faceW < 0.12 {
+		return false
+	}
+
+	// G. 嘴巴中心严格在鼻尖下方
+	mouthAvgY := (rightMouth[1] + leftMouth[1]) / 2
+	offset := mouthAvgY - nose[1]
+	if offset/faceH < 0.05 || offset/faceH > 0.40 {
+		return false
+	}
+
+	// H. 所有 landmark 在 face bbox 内
+	xb := bboxLeft - faceW*0.05
+	x2b := bboxRight + faceW*0.05
 	yb := float32(f.Rect.Min.Y) - faceH*0.05
 	y2b := float32(f.Rect.Max.Y) + faceH*0.05
 	for k := 0; k < 5; k++ {
 		if lm[k][0] < xb || lm[k][0] > x2b || lm[k][1] < yb || lm[k][1] > y2b {
-			return false // landmark 跑出脸框 → 五官不全（侧脸被裁掉）
+			return false
 		}
 	}
 
+	// I. 闭眼拦截：双眼 landmark 附近 Haar eye cascade 必须能检测到
+	if im.eyeCascade != nil {
+		if !im.eyeOpenNear(img, rightEye[0], rightEye[1], faceW, faceH) ||
+			!im.eyeOpenNear(img, leftEye[0], leftEye[1], faceW, faceH) {
+			return false
+		}
+	}
+
+	// J. ✅ 【耳朵空间】YuNet bbox 必须在左右眼角外各留 ≥ 15% faceW 的空间给耳朵
+	// 正脸时 YuNet bbox 覆盖左右耳朵 → bbox 宽 ≥ eyeDx × 1.8
+	// 侧脸 ≥ 30° 时远侧耳朵被裁 → bbox 紧贴眼角 → 过不了
+	minEarSpace := faceW * 0.15
+	// 右边：bbox 左边界 到 右眼角 landmark 的距离
+	rightEarSpace := rightEye[0] - bboxLeft
+	// 左边：bbox 右边界 到 左眼角 landmark 的距离
+	leftEarSpace := bboxRight - leftEye[0]
+	if rightEarSpace < minEarSpace || leftEarSpace < minEarSpace {
+		return false // 至少一侧耳朵空间不够 → 侧脸 / 耳朵被裁
+	}
+
 	return true
+}
+
+// eyeOpenNear 检查 img 中 (cx, cy) 附近是否有一只睁开的眼睛。
+// 以该点为中心，画 eyeW × eyeH 的小矩形（扩边到整像素），在里面跑 Haar eye cascade。
+// 返回 true = 检测到至少一个眼睛矩形。闭眼时眼皮缝高度太小（< 5px）过不了 minSize。
+func (im *Importer) eyeOpenNear(img gocv.Mat, cx, cy, faceW, faceH float32) bool {
+	w := int(maxF32(faceW*0.22, 14))
+	h := int(maxF32(faceH*0.14, 9))
+	x1 := max(0, int(cx)-w/2)
+	y1 := max(0, int(cy)-h/2)
+	x2 := min(img.Cols(), x1+w)
+	y2 := min(img.Rows(), y1+h)
+	if x2-x1 < 10 || y2-y1 < 6 {
+		return false
+	}
+	patch := img.Region(image.Rect(x1, y1, x2, y2))
+	defer patch.Close()
+	gray := gocv.NewMat()
+	defer gray.Close()
+	gocv.CvtColor(patch, &gray, gocv.ColorBGRToGray)
+	rects := im.eyeCascade.DetectMultiScaleWithParams(gray, 1.05, 5, 0, image.Pt(8, 5), image.Pt(0, 0))
+	return len(rects) > 0
 }
 
 func absF32(x float32) float32 {

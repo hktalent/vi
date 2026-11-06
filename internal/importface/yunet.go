@@ -3,7 +3,10 @@ package importface
 import (
 	"fmt"
 	"image"
+	"log"
 	"math"
+	"os"
+	"path/filepath"
 	"sort"
 
 	"gocv.io/x/gocv"

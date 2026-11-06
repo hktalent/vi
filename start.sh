@@ -2,6 +2,7 @@
 # 启动 Qdrant（若未运行）和 vi 服务
 # 首次运行会自动 patch gocv 以兼容 OpenCV 4.11+
 
+pkill -f qdrant
 set -e
 cd "$(dirname "$0")"
 

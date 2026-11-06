@@ -2,12 +2,31 @@ package qdrant
 
 import (
 	"bytes"
+	"crypto/md5"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"time"
 )
+
+// qdrantPointID 把任意业务 personID 确定性映射到 Qdrant 允许的 UUID 格式。
+// Qdrant 要求 point ID 必须是 uint64 或 UUID (RFC4122)，不能是 "import_xxx" 这种业务字符串。
+// 这里用 personID 的 MD5 摘要构造伪 UUIDv4（前 4 位设 0x4，后 2 位设 0x8/0x9 变 version/variant 位），
+// 保证同 personID → 同 UUID → upsert 覆盖语义天然匹配。
+func qdrantPointID(personID string) string {
+	sum := md5.Sum([]byte(personID))
+	b := sum[:]
+	b[6] = (b[6] & 0x0f) | 0x40 // version = 4
+	b[8] = (b[8] & 0x3f) | 0x80 // variant = RFC4122
+	return fmt.Sprintf("%s-%s-%s-%s-%s",
+		hex.EncodeToString(b[0:4]),
+		hex.EncodeToString(b[4:6]),
+		hex.EncodeToString(b[6:8]),
+		hex.EncodeToString(b[8:10]),
+		hex.EncodeToString(b[10:16]))
+}
 
 // Qdrant 是最小化的 Qdrant REST 客户端，只实现本系统需要的操作。
 type Qdrant struct {
@@ -132,14 +151,14 @@ func (q *Qdrant) SearchFace(vec []float32, threshold float64) (Point, error) {
 
 func (q *Qdrant) UpsertFace(id string, vec []float32, payload map[string]any) error {
 	return q.do("PUT", "/collections/"+q.faces+"/points?wait=false", map[string]any{
-		"points": []any{map[string]any{"id": id, "vector": vec, "payload": payload}},
+		"points": []any{map[string]any{"id": qdrantPointID(id), "vector": vec, "payload": payload}},
 	}, nil)
 }
 
 func (q *Qdrant) UpsertPlate(id string, indices []uint32, values []float32, payload map[string]any) error {
 	return q.do("PUT", "/collections/"+q.plates+"/points?wait=false", map[string]any{
 		"points": []any{map[string]any{
-			"id":      id,
+			"id":      qdrantPointID(id),
 			"vector":  map[string]any{"text": map[string]any{"indices": indices, "values": values}},
 			"payload": payload,
 		}},
@@ -162,12 +181,16 @@ func (q *Qdrant) QueryPlate(indices []uint32, values []float32, limit int) ([]Po
 }
 
 // DeletePoints 从指定 collection 删除一批 point。
-// ids 是 point_id 列表（UUID 字符串）。
+// ids 可以是业务 personID（任意字符串），内部自动映射到 Qdrant UUID。
 func (q *Qdrant) DeletePoints(collection string, ids []string) error {
 	if len(ids) == 0 {
 		return nil
 	}
-	body := map[string]any{"points": ids}
+	uuids := make([]string, len(ids))
+	for i, s := range ids {
+		uuids[i] = qdrantPointID(s)
+	}
+	body := map[string]any{"points": uuids}
 	b, _ := json.Marshal(body)
 	req, _ := http.NewRequest("POST", q.base+"/collections/"+collection+"/points/delete", bytes.NewReader(b))
 	req.Header.Set("Content-Type", "application/json")
