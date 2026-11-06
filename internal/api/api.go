@@ -400,6 +400,15 @@ func (s *Server) handleCapture(w http.ResponseWriter, r *http.Request) {
 	ageRange := normAttr(r.FormValue("age_range"), "0-2", "3-9", "10-19", "20-29", "30-39", "40-49", "50-59", "60-69", "70+")
 	glasses := normAttr(r.FormValue("glasses"), "yes", "no")
 
+	// 车牌先过正则校验（前端识别到的乱码直接在后端拒）
+	if kind == "plate" {
+		plate = store.NormalizePlate(plate)
+		if plate == "" {
+			writeErr(w, 400, "车牌号格式不合法：%s", r.FormValue("plate_text"))
+			return
+		}
+	}
+
 	file, _, err := r.FormFile("image")
 	if err != nil {
 		writeErr(w, 400, "缺少图片")
@@ -417,7 +426,15 @@ func (s *Server) handleCapture(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rel, err := s.st.SaveImage(kind, imgBytes, ct, ts)
+	// 预解析 personID → SaveImage 用确定性文件名（同 person + 同天 = 同文件，避免重复存图）
+	var personID string
+	if kind == "face" && len(vec) > 0 {
+		personID = s.st.ResolveFacePersonID(vec)
+	} else if kind == "plate" {
+		personID = store.ResolvePlatePersonID(plate)
+	}
+
+	rel, err := s.st.SaveImage(kind, personID, imgBytes, ct, ts)
 	if err != nil {
 		writeErr(w, 500, "图片保存失败: %v", err)
 		return
@@ -433,6 +450,7 @@ func (s *Server) handleCapture(w http.ResponseWriter, r *http.Request) {
 		PlateText:  plate,
 		PlateConf:  plateConf,
 		ImagePath:  rel,
+		PersonID:   personID, // 预解析的 → Capture 内跳过重复搜索
 		Gender:     gender,
 		AgeRange:   ageRange,
 		Glasses:    glasses,
@@ -443,7 +461,7 @@ func (s *Server) handleCapture(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if res.Skipped {
-		os.Remove(filepath.Join(s.cfg.DataDir, "images", rel))
+		// cooldown 跳过：图片文件是确定性命名（personID+day），已存在就保留最新版本，不删除
 		writeJSON(w, 200, map[string]any{"ok": true, "skipped": true})
 		return
 	}

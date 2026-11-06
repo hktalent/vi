@@ -1,9 +1,10 @@
 package importface
 
 import (
-	"crypto/rand"
+	"crypto/md5"
 	"fmt"
 	"image"
+	"io"
 	"log"
 	"math"
 	"os"
@@ -154,14 +155,19 @@ func (im *Importer) processImage(path string) (int, error) {
 	}
 	defer img.Close()
 
+	// 算文件内容 MD5 前缀（前 8 位 hex）——跨目录同内容图片（即使文件路径/文件名完全不同）也能命中去重
+	contentHash := fileMD5Short(path)
+
 	// 解析 EXIF：GPS 经纬度/海拔/相机方向/创建时间
 	exifInfo := exif.Parse(path)
 
-	// 人脸检测：YuNet（DNN，输出原图坐标）优先；否则 Haar cascade（输出缩放图坐标）
+	// 人脸检测：YuNet（DNN，输出 5 点关键点）优先；否则 Haar cascade
 	detectScale := 1.0
 	var rects []image.Rectangle
+	var yuFaces []YuFace // YuNet 模式下同时拿到含 landmarks 的完整结构
 	if im.yunet != nil {
-		for _, f := range im.yunet.Detect(img) {
+		yuFaces = im.yunet.Detect(img)
+		for _, f := range yuFaces {
 			rects = append(rects, f.Rect)
 		}
 	} else {
@@ -186,11 +192,20 @@ func (im *Importer) processImage(path string) (int, error) {
 
 	saved := 0
 	for i, r := range rects {
-		// 幂等检查：personID 确定性地从路径+索引生成，同一张图同一张脸每次运行结果相同
-		personID := newPersonID(im.label, path, i)
+		// 幂等检查：personID 以文件内容 MD5 为核心，同一张图同一张脸不管在哪个目录都生成相同 personID
+		personID := newPersonID(im.label, contentHash, i)
 		if !im.force && im.existing != nil && im.existing[personID] {
 			im.skipped++
 			continue
+		}
+
+		// YuNet 模式下用 5 点关键点做侧脸 / 五官不全过滤
+		if im.yunet != nil && i < len(yuFaces) {
+			// YuNet 的 bbox 本身就是原图坐标，detectScale=1.0，直接用
+			if !isFrontalFace(yuFaces[i], img.Cols(), img.Rows()) {
+				im.filtered++
+				continue
+			}
 		}
 
 		// 坐标还原到原始图
@@ -314,7 +329,7 @@ func (im *Importer) processImage(path string) (int, error) {
 			}
 		} else {
 			// 无 Store（dry-run 或独立模式）：只写 Qdrant
-			pointID := uuid4()
+			// 用 personID 做 point ID：重复运行覆盖同 person 向量（幂等）
 			payload := map[string]any{
 				"kind":        "face",
 				"person_id":   personID,
@@ -323,7 +338,7 @@ func (im *Importer) processImage(path string) (int, error) {
 				"imported_at": time.Now().In(im.cfg.Location).Format(time.RFC3339),
 				"crop":        rel,
 			}
-			if err := im.qd.UpsertFace(pointID, embedding, payload); err != nil {
+			if err := im.qd.UpsertFace(personID, embedding, payload); err != nil {
 				log.Printf("[import] upsert Qdrant 失败: %v", err)
 				continue
 			}
@@ -420,6 +435,7 @@ func matToFloat32(m gocv.Mat) ([]float32, error) {
 
 // saveFaceCrop 把人脸抠图落盘到 data/images/import/ 目录。
 // 文件名基于 personID（确定性），同一张图同一张脸多次运行生成相同文件名，不会重复保存。
+// 路径：images/import/personID.jpg（扁平结构，import 的 personID 已含文件内容 MD5）。
 func (im *Importer) saveFaceCrop(srcPath string, personID string, crop gocv.Mat) (string, error) {
 	ext := strings.ToLower(filepath.Ext(srcPath))
 	switch ext {
@@ -431,7 +447,7 @@ func (im *Importer) saveFaceCrop(srcPath string, personID string, crop gocv.Mat)
 	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
 		return "", err
 	}
-	// 文件已存在且内容未变 → 跳过（幂等）
+	// 文件已存在 → 跳过（幂等）
 	if _, err := os.Stat(full); err == nil {
 		return rel, nil
 	}
@@ -454,16 +470,27 @@ func (im *Importer) writeFacesLog(path string, n int) {
 	log.Printf("[import] %s → %d 张人脸", filepath.Base(path), n)
 }
 
-func newPersonID(label, sourcePath string, idx int) string {
-	base := filepath.Base(filepath.Dir(sourcePath))
-	if base == "." {
-		base = filepath.Base(sourcePath)
-	}
-	base = sanitize(base)
+func newPersonID(label, contentHash string, idx int) string {
+	base := "import"
 	if label != "" {
 		base = sanitize(label)
 	}
-	return fmt.Sprintf("import_%s_%s_%d", base, shortHash(sourcePath), idx)
+	return fmt.Sprintf("import_%s_%s_%d", base, contentHash, idx)
+}
+
+// fileMD5Short 读整个文件算 MD5，返回前 8 位 hex。
+// 读错误时退化为文件路径的字符串 hash（保证 personID 至少可预测）。
+func fileMD5Short(path string) string {
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Sprintf("err%x", shortHash(path))
+	}
+	defer f.Close()
+	h := md5.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return fmt.Sprintf("err%x", shortHash(path))
+	}
+	return fmt.Sprintf("%x", h.Sum(nil)[:4]) // 4 字节 = 8 hex 位，足够同文件唯一，同时 personID 不会过长
 }
 
 func sanitize(s string) string {
@@ -638,15 +665,93 @@ func (im *Importer) hasFacialFeatures(crop gocv.Mat) bool {
 	return false
 }
 
-// uuid4 生成一个 UUID v4 字符串（随机 122 bit + 固定 version/variant）。
-func uuid4() string {
-	var b [16]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		// crypto/rand 理论上不会失败，万一失败用 zero-padded fallback
-		return "00000000-0000-4000-8000-000000000000"
+// isFrontalFace 用 YuNet 5 点关键点判断人脸是否足够正 / 五官是否完整。
+// 5 个点顺序：右眼、左眼、鼻尖、右嘴角、左嘴角。
+//
+// 通过条件（全部满足才返回 true）：
+//  1. 双眼水平距离占脸宽 ≥ 12%：侧脸时双眼几乎叠在一起，比例会 < 10%
+//  2. 双眼垂直倾斜占脸高 ≤ 30%：正常脸双眼水平对齐，倾斜过多说明偏/晃
+//  3. 鼻尖在双眼之间（x 在 eye_left.x ~ eye_right.x 范围内）：侧脸时鼻尖会跑到眼睛一侧外面
+//  4. 嘴角 y > 鼻尖 y（嘴巴在鼻子下面）：反向说明脸可能歪到不可识别
+//  5. 所有 landmark 都在脸 bbox 内（无越界）：五官不全（比如只看到半张脸）时会有 landmark 跑出 bbox
+func isFrontalFace(f YuFace, imgW, imgH int) bool {
+	lm := f.Landmarks
+	// 先确认 5 个点坐标都合理（不是 NaN、不是 0、不在图片外 5px）
+	for k := 0; k < 5; k++ {
+		x, y := lm[k][0], lm[k][1]
+		if x != x || y != y {
+			return false // NaN
+		}
+		if x < -5 || y < -5 || x > float32(imgW+5) || y > float32(imgH+5) {
+			return false // 完全越界
+		}
 	}
-	b[6] = (b[6] & 0x0f) | 0x40 // version 4
-	b[8] = (b[8] & 0x3f) | 0x80 // variant 10xx
-	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
-		b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+
+	faceW := float32(f.Rect.Dx())
+	faceH := float32(f.Rect.Dy())
+	if faceW < 20 || faceH < 20 {
+		return false
+	}
+	rightEye := lm[0]
+	leftEye := lm[1]
+	nose := lm[2]
+	rightMouth := lm[3]
+	leftMouth := lm[4]
+
+	// 1. 双眼水平距离
+	eyeDx := absF32(leftEye[0] - rightEye[0])
+	if eyeDx/faceW < 0.12 {
+		return false // 双眼太近 → 侧脸严重
+	}
+
+	// 2. 双眼垂直倾斜
+	eyeDy := absF32(leftEye[1] - rightEye[1])
+	if eyeDy/faceH > 0.30 {
+		return false // 倾斜过大
+	}
+
+	// 3. 鼻尖在双眼之间（允许少量偏移）
+	eyeMinX := minF32(leftEye[0], rightEye[0])
+	eyeMaxX := maxF32(leftEye[0], rightEye[0])
+	if nose[0] < eyeMinX-eyeDx*0.2 || nose[0] > eyeMaxX+eyeDx*0.2 {
+		return false // 鼻尖不在双眼中间 → 脸转太多
+	}
+
+	// 4. 嘴角 y 在鼻尖 y 下方（嘴巴在鼻子下，允许少量）
+	mouthAvgY := (rightMouth[1] + leftMouth[1]) / 2
+	if mouthAvgY < nose[1]-faceH*0.05 {
+		return false
+	}
+
+	// 5. 所有 landmark 在 face bbox 内（含 5% 宽松）
+	xb := float32(f.Rect.Min.X) - faceW*0.05
+	x2b := float32(f.Rect.Max.X) + faceW*0.05
+	yb := float32(f.Rect.Min.Y) - faceH*0.05
+	y2b := float32(f.Rect.Max.Y) + faceH*0.05
+	for k := 0; k < 5; k++ {
+		if lm[k][0] < xb || lm[k][0] > x2b || lm[k][1] < yb || lm[k][1] > y2b {
+			return false // landmark 跑出脸框 → 五官不全（侧脸被裁掉）
+		}
+	}
+
+	return true
+}
+
+func absF32(x float32) float32 {
+	if x < 0 {
+		return -x
+	}
+	return x
+}
+func minF32(a, b float32) float32 {
+	if a < b {
+		return a
+	}
+	return b
+}
+func maxF32(a, b float32) float32 {
+	if a > b {
+		return a
+	}
+	return b
 }

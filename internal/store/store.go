@@ -11,6 +11,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -160,7 +161,10 @@ func newID() string {
 }
 
 // SaveImage 把前端裁剪好的人脸/车牌图片落盘，返回相对路径。
-func (s *Store) SaveImage(kind string, data []byte, contentType string, ts time.Time) (string, error) {
+// personID 用于生成确定性文件名（同 personID + 同 day → 同文件名）。
+// personID 不为空时，文件总被覆盖写入 → 保证"最后一次采集"替换前面所有版本。
+// 不传 personID（空串）时回退到随机 UUID（仅兼容旧调用）。
+func (s *Store) SaveImage(kind string, personID string, data []byte, contentType string, ts time.Time) (string, error) {
 	ext := ".jpg"
 	switch contentType {
 	case "image/png":
@@ -172,12 +176,42 @@ func (s *Store) SaveImage(kind string, data []byte, contentType string, ts time.
 	if err := os.MkdirAll(filepath.Join(s.cfg.DataDir, "images", dir), 0o755); err != nil {
 		return "", err
 	}
-	name := fmt.Sprintf("%s-%s%s", kind, newID(), ext)
+	var name string
+	if personID != "" {
+		// 确定性命名：同 personID 同天 → 同文件。后一次覆盖前一次 = 只保留最后一次采集。
+		name = fmt.Sprintf("%s-%s-%04d%02d%02d%s", kind, personID, ts.Year(), ts.Month(), ts.Day(), ext)
+	} else {
+		name = fmt.Sprintf("%s-%s%s", kind, newID(), ext)
+	}
 	rel := filepath.Join(dir, name)
-	if err := os.WriteFile(filepath.Join(s.cfg.DataDir, "images", rel), data, 0o644); err != nil {
+	full := filepath.Join(s.cfg.DataDir, "images", rel)
+	// 无论 personID 模式还是 UUID 模式，总 WriteFile → 新图覆盖旧图。
+	// personID 模式下的幂等 / 去重在更上层解决：API 层 cooldown、importfaces 的 existing personID 跳过。
+	if err := os.WriteFile(full, data, 0o644); err != nil {
 		return "", err
 	}
 	return rel, nil
+}
+
+// ResolveFacePersonID 给 512 维人脸向量解析 personID：
+// Qdrant 里有匹配 → 返回已有的 personID；没有匹配 → 生成新 personID。
+// API 层需要在 SaveImage 之前拿到 personID 才能用确定性文件名。
+func (s *Store) ResolveFacePersonID(vec []float32) string {
+	if hit, err := s.qd.SearchFace(vec, s.cfg.FaceThresh); err == nil && hit.ID != "" {
+		if pid, ok := hit.Payload["person_id"].(string); ok && pid != "" {
+			return pid
+		}
+	}
+	return "face-" + newID()
+}
+
+// ResolvePlatePersonID 给车牌号解析 personID（车牌正则已在 normalizePlate 里校验）。
+func ResolvePlatePersonID(plateText string) string {
+	plateText = normalizePlate(plateText)
+	if plateText == "" {
+		return ""
+	}
+	return "plate:" + plateText
 }
 
 // Capture 处理一次采集：逆地理编码 -> 身份匹配 -> 冷却判断 -> 落盘/入库 -> 命中标签。
@@ -191,6 +225,7 @@ type CaptureInput struct {
 	PlateText  string
 	PlateConf  float64
 	ImagePath  string
+	PersonID   string // 可选：API 层预解析的 personID（确定性文件名依赖它）。空则 Capture 内部解析。
 	Gender     string
 	AgeRange   string
 	Glasses    string
@@ -220,14 +255,19 @@ func (s *Store) Capture(in CaptureInput) (*CaptureResult, error) {
 		if len(in.Vector) == 0 {
 			return nil, errors.New("人脸特征向量为空")
 		}
-		if hit, err := s.qd.SearchFace(in.Vector, s.cfg.FaceThresh); err != nil {
-			log.Printf("[qdrant] 人脸检索失败: %v", err)
-		} else if hit.ID != "" {
-			personID, _ = hit.Payload["person_id"].(string)
-			sim = hit.Score
-		}
-		if personID == "" {
-			personID = "face-" + newID()
+		if in.PersonID != "" {
+			// API 层预解析了 personID（用于确定性文件名），跳过重复搜索
+			personID = in.PersonID
+		} else {
+			if hit, err := s.qd.SearchFace(in.Vector, s.cfg.FaceThresh); err != nil {
+				log.Printf("[qdrant] 人脸检索失败: %v", err)
+			} else if hit.ID != "" {
+				personID, _ = hit.Payload["person_id"].(string)
+				sim = hit.Score
+			}
+			if personID == "" {
+				personID = "face-" + newID()
+			}
 		}
 	case "plate":
 		in.PlateText = normalizePlate(in.PlateText)
@@ -307,7 +347,10 @@ func (s *Store) Capture(in CaptureInput) (*CaptureResult, error) {
 		if e.Glasses != "" {
 			payload["glasses"] = e.Glasses
 		}
-		if err := s.qd.UpsertFace(e.ID, in.Vector, payload); err != nil {
+		payload["updated_at"] = time.Now().Format(time.RFC3339)
+		// 用 personID 做 point ID：同人重复采集 → 覆盖向量（避免一份人存多份 embedding 浪费 Qdrant 空间）
+		// event log 里每次仍生成新的 e.ID（保留每次事件的时间/坐标），但 Qdrant 向量只保留最新的
+		if err := s.qd.UpsertFace(e.PersonID, in.Vector, payload); err != nil {
 			log.Printf("[qdrant] 人脸写入失败: %v", err)
 		}
 	}
@@ -420,7 +463,7 @@ func (s *Store) ImportFace(in ImportFaceInput) (*Event, error) {
 	if e.Heading != nil {
 		payload["heading"] = *e.Heading
 	}
-	if err := s.qd.UpsertFace(e.ID, in.Vector, payload); err != nil {
+	if err := s.qd.UpsertFace(e.PersonID, in.Vector, payload); err != nil {
 		return e, fmt.Errorf("upsert face: %w", err)
 	}
 	return e, nil
@@ -527,16 +570,26 @@ func (s *Store) rewriteEventsFile() error {
 	return nil
 }
 
-// normalizePlate 把车牌号规整为大写无空格（内部使用）。
+// 中国车牌号正则：覆盖蓝牌/黄牌（7位）、新能源（8位）、港澳/领馆/使馆/警/挂/学/使领 等特殊后缀。
+// 省份简称：京津沪渝冀豫云辽黑湘皖鲁新苏浙赣鄂桂甘晋蒙陕吉闽贵粤青藏川宁琼使领
+// 第二位字母：A-HJ-NP-Z（排除 I、O）。特殊使/领 可多一位。
+// 后半段：普通 5 位；新能源 D/F + 5位 或 5位 + D/F；特殊后缀挂学警港澳使领
+var plateRe = regexp.MustCompile(`^(京|津|沪|渝|冀|豫|云|辽|黑|湘|皖|鲁|新|苏|浙|赣|鄂|桂|甘|晋|蒙|陕|吉|闽|贵|粤|青|藏|川|宁|琼|使|领)[A-HJ-NP-Z](([0-9A-HJ-NP-Z]{5}[DF])|([DF][0-9A-HJ-NP-Z]{5})|([0-9A-HJ-NP-Z]{4}[挂学警港澳使领])|([0-9A-HJ-NP-Z]{5}))$`)
+
+// normalizePlate 规整车牌号并校验格式；非法返回空串。
+// 规整规则：去空格/·/-、大写、去前后缀 "粤·A12345" → "粤A12345"。
 func normalizePlate(s string) string {
 	s = strings.ToUpper(strings.TrimSpace(s))
 	s = strings.ReplaceAll(s, "·", "")
 	s = strings.ReplaceAll(s, " ", "")
 	s = strings.ReplaceAll(s, "-", "")
+	if !plateRe.MatchString(s) {
+		return ""
+	}
 	return s
 }
 
-// NormalizePlate 把车牌号规整为大写无空格（导出供 API 层使用）。
+// NormalizePlate 导出版。
 func NormalizePlate(s string) string { return normalizePlate(s) }
 
 // LabelsFor 返回某次采集命中的标签（按身份查标签表）。
