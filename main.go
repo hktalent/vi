@@ -274,6 +274,11 @@ func runImportFaces(args []string) int {
 	faceCol := fs.String("face-collection", env("VI_FACE_COLLECTION", "vi_faces"), "人脸集合名")
 	dataDir := fs.String("data", env("VI_DATA", "data"), "数据目录（保存抠图）")
 	modelsDir := fs.String("models", env("VI_MODELS", "models"), "模型目录")
+	video := fs.Bool("video", false, "同时扫描视频文件（MOV/MP4/AVI/MKV 等）导入其中的人脸和车牌")
+	videoFaces := fs.Bool("video-faces", true, "视频导入人脸（需 -video）")
+	videoPlates := fs.Bool("video-plates", true, "视频导入车牌（需 -video）")
+	videoStep := fs.Float64("video-step", 1, "视频抽帧间隔秒数（需 -video，1=每秒 1 帧）")
+	videoMax := fs.Int("video-max", 200, "每个视频最多抽帧数（需 -video）")
 	if err := fs.Parse(args); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 2
@@ -338,7 +343,14 @@ func runImportFaces(args []string) int {
 	}
 
 	enh := imgenh.New(cfg.DataDir)
-	imp, err := importface.NewImporter(cfg, qd, st, cascadePath, arcPath, yunetPath, *label, *dryRun, *force, enh)
+	vopts := importface.VideoOptions{
+		Enabled:   *video,
+		Faces:     *videoFaces,
+		Plates:    *videoPlates,
+		StepSec:   *videoStep,
+		MaxFrames: *videoMax,
+	}
+	imp, err := importface.NewImporter(cfg, qd, st, cascadePath, arcPath, yunetPath, *label, *dryRun, *force, enh, vopts)
 	if err != nil {
 		log.Fatalf("初始化 Importer 失败: %v", err)
 	}

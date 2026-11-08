@@ -44,6 +44,28 @@ type Importer struct {
 	skipped     int               // 跳过数量统计
 	filtered    int               // 被 norm / 侧脸 / 五官不全过滤丢弃的数量统计
 	enh         *imgenh.Enhancer  // 异步高清增强（nil=不增强）
+	video       VideoOptions      // 视频导入选项（Enabled=false 时只扫图片）
+	plate       *PlateEngine      // 车牌引擎（视频且启用车牌时加载）
+}
+
+// VideoOptions 控制 MOV/MP4 等视频的导入行为。
+type VideoOptions struct {
+	Enabled   bool    // 是否扫描视频文件
+	Faces     bool    // 是否导入视频中的人脸
+	Plates    bool    // 是否导入视频中的人脸/车牌
+	StepSec   float64 // 采样间隔（秒），默认 1
+	MaxFrames int     // 每个视频最多采样帧数，默认 200
+}
+
+// withDefaults 补齐零值选项。
+func (o VideoOptions) withDefaults() VideoOptions {
+	if o.StepSec <= 0 {
+		o.StepSec = 1
+	}
+	if o.MaxFrames <= 0 {
+		o.MaxFrames = 200
+	}
+	return o
 }
 
 // seenFace 批次内已见过的一张脸，用于 Run 循环中的同人去重。
@@ -89,7 +111,8 @@ func (im *Importer) matchBatch(vec []float32) (string, float64) {
 // yunetPath 是 YuNet 检测模型路径（face_detection_yunet_2023mar.onnx），存在时优先于 Haar cascade。
 // cascadeXML 是 OpenCV Haar cascade 路径（YuNet 缺失时的回退检测器），arcOnnx 是 arc.onnx 路径（提取 embedding 用）。
 // force=true 时忽略已有导入记录，全部重新导入。
-func NewImporter(cfg config.Config, qd *qdrant.Qdrant, st *store.Store, cascadeXML, arcOnnx, yunetPath, label string, dryRun, force bool, enh *imgenh.Enhancer) (*Importer, error) {
+func NewImporter(cfg config.Config, qd *qdrant.Qdrant, st *store.Store, cascadeXML, arcOnnx, yunetPath, label string, dryRun, force bool, enh *imgenh.Enhancer, video VideoOptions) (*Importer, error) {
+	video = video.withDefaults()
 	im := &Importer{
 		cfg:         cfg,
 		qd:          qd,
@@ -101,6 +124,17 @@ func NewImporter(cfg config.Config, qd *qdrant.Qdrant, st *store.Store, cascadeX
 		batchThresh: 0.58, // 批次内更严格阈值（ArcFace 同人 ≥ 0.65，不同人 ≤ 0.48，0.58 是安全分界）
 		seen:        []seenFace{},
 		enh:         enh,
+		video:       video,
+	}
+
+	// 视频车牌引擎按需加载（仅在启用视频且启用车牌时）
+	if video.Enabled && video.Plates {
+		pe, err := NewPlateEngine(filepath.Join(cfg.ModelsDir))
+		if err != nil {
+			log.Printf("[import] ⚠️  车牌引擎不可用，视频只导入人脸: %v", err)
+		} else {
+			im.plate = pe
+		}
 	}
 
 	// 检测器：优先 YuNet（DNN，准确率高且输出 5 点关键点）；加载失败回退 Haar cascade
@@ -174,8 +208,9 @@ func (im *Importer) Run(dir string) (int, error) {
 		return 0, err
 	}
 
-	var imagePaths []string
+	var imagePaths, videoPaths []string
 	exts := map[string]bool{".jpg": true, ".jpeg": true, ".png": true, ".bmp": true, ".webp": true, ".heic": true}
+	videoExts := map[string]bool{".mov": true, ".mp4": true, ".m4v": true, ".avi": true, ".mkv": true, ".3gp": true, ".mpg": true, ".mpeg": true}
 	filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
 			return nil
@@ -183,11 +218,18 @@ func (im *Importer) Run(dir string) (int, error) {
 		ext := strings.ToLower(filepath.Ext(p))
 		if exts[ext] {
 			imagePaths = append(imagePaths, p)
+		} else if im.video.Enabled && videoExts[ext] {
+			videoPaths = append(videoPaths, p)
 		}
 		return nil
 	})
 
-	log.Printf("[import] 发现 %d 张图片，开始处理...", len(imagePaths))
+	if im.video.Enabled {
+		log.Printf("[import] 发现 %d 张图片 + %d 个视频（采样间隔 %.1fs，每视频最多 %d 帧，人脸=%v 车牌=%v）",
+			len(imagePaths), len(videoPaths), im.video.StepSec, im.video.MaxFrames, im.video.Faces, im.video.Plates)
+	} else {
+		log.Printf("[import] 发现 %d 张图片，开始处理...", len(imagePaths))
+	}
 
 	success, failed := 0, 0
 	var firstErr error
@@ -203,13 +245,45 @@ func (im *Importer) Run(dir string) (int, error) {
 		}
 		success += faces
 	}
+
+	// 视频导入：ffmpeg 抽帧 → 复用图片人脸管线 + 车牌检测识别
+	videoFaces, videoPlates := 0, 0
+	if im.video.Enabled {
+		for i, p := range videoPaths {
+			fmt.Fprintf(os.Stderr, "\r[视频 %d/%d] %s", i+1, len(videoPaths), filepath.Base(p))
+			faces, plates, err := im.processVideo(p)
+			if err != nil {
+				failed++
+				if firstErr == nil {
+					firstErr = fmt.Errorf("%s: %w", filepath.Base(p), err)
+				}
+				log.Printf("[import] ⚠️  视频处理失败 %s: %v", filepath.Base(p), err)
+				continue
+			}
+			success += faces
+			videoFaces += faces
+			videoPlates += plates
+		}
+	}
+
 	fmt.Fprintln(os.Stderr)
-	log.Printf("[import] 完成: %d 张图片 → %d 张新人脸导入 / %d 张已存在跳过 / %d 张误检过滤 / %d 张图片处理失败",
+	log.Printf("[import] 完成: %d 张图片 → %d 张新人脸导入 / %d 张已存在跳过 / %d 张误检过滤 / %d 个文件处理失败",
 		len(imagePaths), success, im.skipped, im.filtered, failed)
+	if im.video.Enabled {
+		log.Printf("[import] 视频: %d 个 → 新人脸 %d / 新车牌 %d", len(videoPaths), videoFaces, videoPlates)
+	}
 	if firstErr != nil {
 		return success, firstErr
 	}
 	return success, nil
+}
+
+// faceSrcMeta 描述一帧画面的来源，让照片与视频抽帧复用同一条人脸导入管线。
+type faceSrcMeta struct {
+	srcPath    string             // 事件来源（照片路径或视频路径）
+	info       exif.PhotoInfo     // EXIF/GPS 信息（视频为空，用 capturedAt 兜底）
+	capturedAt time.Time          // 非零时优先于 info.CreatedAt
+	dedupe     map[string]float64 // 非 nil：视频模式，同 personID 只保留质量最佳帧
 }
 
 // processImage 处理一张图片：检测所有人脸 → embedding 去重 → 保存。
@@ -221,8 +295,27 @@ func (im *Importer) processImage(path string) (int, int, error) {
 	defer img.Close()
 
 	// 解析 EXIF：GPS 经纬度/海拔/相机方向/创建时间
-	exifInfo := exif.Parse(path)
+	meta := faceSrcMeta{srcPath: path, info: exif.Parse(path)}
+	saved, filteredThisImg, detections := im.importFacesFromMat(img, meta)
 
+	// ✅ 真正可信的日志：原始检测 / 通过五官 / 被过滤
+	if detections > 0 {
+		p := filepath.Base(path)
+		switch {
+		case saved > 0 && filteredThisImg > 0:
+			log.Printf("[import] %s → 检测 %d 张 · 通过五官 %d · 过滤 %d（闭眼/侧脸/五官不全）", p, detections, saved, filteredThisImg)
+		case saved > 0:
+			log.Printf("[import] %s → %d 张人脸（全部通过五官检查）", p, saved)
+		default:
+			log.Printf("[import] %s → 检测 %d 张 · 全部被五官检查过滤（闭眼/侧脸/五官不全）", p, detections)
+		}
+	}
+	return saved, filteredThisImg, nil
+}
+
+// importFacesFromMat 在已解码的一帧画面上做人脸检测 → 质量验证 → 去重 → 落盘 → 写事件。
+// 返回 (本次写入的新人脸数, 本帧被过滤数, 原始检测数)。
+func (im *Importer) importFacesFromMat(img gocv.Mat, meta faceSrcMeta) (int, int, int) {
 	// 人脸检测：YuNet（DNN，输出 5 点关键点）优先；否则 Haar cascade
 	detectScale := 1.0
 	var rects []image.Rectangle
@@ -248,7 +341,7 @@ func (im *Importer) processImage(path string) (int, int, error) {
 	}
 
 	if len(rects) == 0 {
-		return 0, 0, nil
+		return 0, 0, 0
 	}
 
 	saved := 0
@@ -366,6 +459,31 @@ func (im *Importer) processImage(path string) (int, int, error) {
 		// 记录到批次 seen 列表，后续同人匹配用（existing 检查之前就要加，否则同一张图里的多张同人脸会重复生成 personID）
 		im.seen = append(im.seen, seenFace{personID: personID, vec: embedding})
 
+		// 视频模式：同一 personID 只保留质量最高的那一帧
+		//   已有帧 → 分数不更高直接跳过；更高 → 覆盖抠图（不重复写事件）
+		if meta.dedupe != nil {
+			score := float64(1)
+			if im.yunet != nil && i < len(yuFaces) {
+				score = float64(yuFaces[i].Score)
+			}
+			best, seenBefore := meta.dedupe[personID]
+			if seenBefore {
+				if score <= best+0.03 {
+					crop.Close()
+					continue
+				}
+				meta.dedupe[personID] = score
+				if !im.dryRun {
+					if _, err := im.saveFaceCrop(personID, crop); err != nil {
+						log.Printf("[import] 覆盖更清晰帧失败: %v", err)
+					}
+				}
+				crop.Close()
+				continue
+			}
+			meta.dedupe[personID] = score
+		}
+
 		// ImportFace 的 existing 检查：personID 已存在（-force 模式）→ 跳过
 		// 🔴 必须在 saveFaceCrop 之前检查，避免磁盘 I/O + 覆盖已存图片
 		if !im.force && im.existing != nil && im.existing[personID] {
@@ -393,7 +511,10 @@ func (im *Importer) processImage(path string) (int, int, error) {
 
 		// 2) 再写 Qdrant 向量 + 事件日志（ImportFace 保证向量失败时不落事件）
 		if im.st != nil {
-			capturedAt := exifInfo.CreatedAt
+			capturedAt := meta.capturedAt
+			if capturedAt.IsZero() {
+				capturedAt = meta.info.CreatedAt
+			}
 			if capturedAt.IsZero() {
 				capturedAt = time.Now()
 			}
@@ -402,12 +523,12 @@ func (im *Importer) processImage(path string) (int, int, error) {
 				PersonID:   personID,
 				Vector:     embedding,
 				ImagePath:  rel,
-				SourcePath: path,
+				SourcePath: meta.srcPath,
 				CapturedAt: capturedAt,
-				Lat:        exifInfo.Latitude,
-				Lon:        exifInfo.Longitude,
-				Altitude:   exifInfo.Altitude,
-				Heading:    exifInfo.Heading,
+				Lat:        meta.info.Latitude,
+				Lon:        meta.info.Longitude,
+				Altitude:   meta.info.Altitude,
+				Heading:    meta.info.Heading,
 			}); err != nil {
 				log.Printf("[import] ImportFace 失败: %v（回滚已存抠图）", err)
 				os.Remove(filepath.Join(im.cfg.DataDir, "images", rel))
@@ -418,8 +539,8 @@ func (im *Importer) processImage(path string) (int, int, error) {
 			payload := map[string]any{
 				"kind":        "face",
 				"person_id":   personID,
-				"source_path": path,
-				"source_file": filepath.Base(path),
+				"source_path": meta.srcPath,
+				"source_file": filepath.Base(meta.srcPath),
 				"imported_at": time.Now().In(im.cfg.Location).Format(time.RFC3339),
 				"crop":        rel,
 			}
@@ -433,20 +554,7 @@ func (im *Importer) processImage(path string) (int, int, error) {
 		crop.Close()
 		saved++
 	}
-
-	// ✅ 真正可信的日志：原始检测 / 通过五官 / 被过滤
-	if len(rects) > 0 {
-		p := filepath.Base(path)
-		switch {
-		case saved > 0 && filteredThisImg > 0:
-			log.Printf("[import] %s → 检测 %d 张 · 通过五官 %d · 过滤 %d（闭眼/侧脸/五官不全）", p, len(rects), saved, filteredThisImg)
-		case saved > 0:
-			log.Printf("[import] %s → %d 张人脸（全部通过五官检查）", p, saved)
-		default:
-			log.Printf("[import] %s → 检测 %d 张 · 全部被五官检查过滤（闭眼/侧脸/五官不全）", p, len(rects))
-		}
-	}
-	return saved, filteredThisImg, nil
+	return saved, filteredThisImg, len(rects)
 }
 
 // extractEmbedding 用 arc.onnx 提取 512 维特征向量。

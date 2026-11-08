@@ -1,0 +1,1 @@
+/Users/51pwn/MyWork/stock-system/web/footer.js

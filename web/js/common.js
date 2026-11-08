@@ -340,3 +340,140 @@ window.setChip = setChip;
 window.fmtCoord = fmtCoord;
 window.headingToDirection = headingToDirection;
 window._isIOSSafari = _isIOSSafari;
+
+// —— 底部「关于」：用 JS 渲染当前项目 README ——
+// 由共用 footer.js（stock-system/web/footer.js）里的 data-about 链接触发
+function _mdEsc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g,
+    c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+function _mdInline(s) {
+  return _mdEsc(s)
+    .replace(/`([^`]+)`/g, '<code>$1</code>')
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+    .replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g,
+      '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+}
+
+// 极简 Markdown 渲染：标题 / 代码块 / 表格 / 列表 / 分割线 / 粗体 / 行内代码 / 链接
+function mdToHtml(md) {
+  const lines = String(md || '').replace(/\r\n/g, '\n').split('\n');
+  const out = [];
+  const isSpecial = s => /^(#{1,6}\s|```|\s*\||\s*[-*+]\s|\s*\d+\.\s|---\s*$)/.test(s);
+
+  for (let i = 0; i < lines.length;) {
+    const line = lines[i];
+
+    if (/^```/.test(line)) {
+      const buf = [];
+      for (i++; i < lines.length && !/^```/.test(lines[i]); i++) buf.push(lines[i]);
+      i++;
+      out.push('<pre><code>' + _mdEsc(buf.join('\n')) + '</code></pre>');
+      continue;
+    }
+
+    const h = line.match(/^(#{1,6})\s+(.*)$/);
+    if (h) {
+      const n = h[1].length;
+      out.push(`<h${n}>${_mdInline(h[2].replace(/\s*#+\s*$/, ''))}</h${n}>`);
+      i++;
+      continue;
+    }
+
+    if (/^(---|___|\*\*\*)\s*$/.test(line)) { out.push('<hr>'); i++; continue; }
+
+    if (/^\s*\|/.test(line) && /^\s*\|/.test(lines[i + 1] || '')) {
+      const rows = [];
+      while (i < lines.length && /^\s*\|/.test(lines[i])) rows.push(lines[i++]);
+      const cells = r => r.trim().replace(/^\||\|$/g, '').split('|').map(c => _mdInline(c.trim()));
+      const head = cells(rows[0]);
+      const body = rows.slice(2).map(cells);
+      out.push('<table><thead><tr>' + head.map(c => `<th>${c}</th>`).join('') + '</tr></thead><tbody>' +
+        body.map(r => '<tr>' + r.map(c => `<td>${c}</td>`).join('') + '</tr>').join('') +
+        '</tbody></table>');
+      continue;
+    }
+
+    const ul = line.match(/^\s*[-*+]\s+(.*)$/);
+    if (ul) {
+      const items = [];
+      while (i < lines.length) {
+        const m = lines[i].match(/^\s*[-*+]\s+(.*)$/);
+        if (!m) break;
+        items.push(`<li>${_mdInline(m[1])}</li>`);
+        i++;
+      }
+      out.push('<ul>' + items.join('') + '</ul>');
+      continue;
+    }
+
+    const ol = line.match(/^\s*\d+\.\s+(.*)$/);
+    if (ol) {
+      const items = [];
+      while (i < lines.length) {
+        const m = lines[i].match(/^\s*\d+\.\s+(.*)$/);
+        if (!m) break;
+        items.push(`<li>${_mdInline(m[1])}</li>`);
+        i++;
+      }
+      out.push('<ol>' + items.join('') + '</ol>');
+      continue;
+    }
+
+    if (line.trim() === '') { i++; continue; }
+
+    const buf = [];
+    while (i < lines.length && lines[i].trim() !== '' && !isSpecial(lines[i])) buf.push(lines[i++]);
+    if (buf.length) out.push('<p>' + _mdInline(buf.join(' ')) + '</p>');
+    else i++;
+  }
+  return out.join('\n');
+}
+
+async function openAbout() {
+  document.getElementById('aboutMask')?.remove();
+  const mask = document.createElement('div');
+  mask.id = 'aboutMask';
+  mask.className = 'about-mask';
+  mask.innerHTML = `
+    <div class="about-panel" role="dialog" aria-modal="true" aria-label="关于">
+      <div class="about-head"><span>关于 · 见到你</span><button class="about-close" aria-label="关闭">×</button></div>
+      <div class="about-body"><div class="md">README 加载中…</div></div>
+    </div>`;
+  document.body.appendChild(mask);
+
+  const close = () => {
+    mask.remove();
+    document.removeEventListener('keydown', onKey);
+  };
+  const onKey = e => { if (e.key === 'Escape') close(); };
+  mask.querySelector('.about-close').addEventListener('click', close);
+  mask.addEventListener('click', e => { if (e.target === mask) close(); });
+  document.addEventListener('keydown', onKey);
+
+  const box = mask.querySelector('.md');
+  try {
+    box.innerHTML = mdToHtml(await _loadReadme());
+  } catch (e) {
+    box.innerHTML = '<p class="about-err">README 加载失败：' + _mdEsc(e.message || e) + '</p>';
+  }
+}
+
+// 优先新接口 /api/readme（JSON），旧版本服务未重启时回退到静态 /readme.md
+async function _loadReadme() {
+  try {
+    const r = await fetch('/api/readme', { cache: 'no-store' });
+    const ct = (r.headers.get('content-type') || '').toLowerCase();
+    if (r.ok && ct.indexOf('json') >= 0) {
+      const d = await r.json();
+      if (d && typeof d.markdown === 'string') return d.markdown;
+    }
+  } catch (_) { /* 回退到静态文件 */ }
+  const r2 = await fetch('/readme.md', { cache: 'no-store' });
+  if (!r2.ok) throw new Error('HTTP ' + r2.status);
+  return r2.text();
+}
+
+window.GP_openAbout = openAbout;
+

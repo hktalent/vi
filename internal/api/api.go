@@ -47,6 +47,8 @@ func NewServer(cfg config.Config, st *store.Store, fc *importface.FaceChecker, e
 	s.mux.HandleFunc("POST /api/capture", s.handleCapture)
 	// /api/geocode 公开：首页实时定位展示地址用
 	s.mux.HandleFunc("GET  /api/geocode", s.handleGeocode)
+	// /api/readme 公开：底部「关于」用前端 JS 渲染项目 README
+	s.mux.HandleFunc("GET  /api/readme", s.handleReadme)
 
 	// —— 需登录 ——
 	s.mux.HandleFunc("GET  /api/media-url", auth.RequireAuth(s.handleMediaSignedURL))
@@ -204,6 +206,17 @@ func (s *Server) handleMediaSignedURL(w http.ResponseWriter, r *http.Request) {
 }
 
 // —— 业务 handlers ——
+
+// handleReadme 返回项目根目录 README.md，供底部「关于」在前端渲染。
+func (s *Server) handleReadme(w http.ResponseWriter, r *http.Request) {
+	path := filepath.Join(filepath.Dir(s.cfg.WebDir), "README.md")
+	b, err := os.ReadFile(path)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "README.md 不存在")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"markdown": string(b)})
+}
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	qdOK := true
