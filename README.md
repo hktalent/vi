@@ -261,7 +261,8 @@ cd vi/
 ./impt.sh "/Users/${USER}/Pictures/Photos Library.photoslibrary/" "手机时光"
 ./impt.sh "/Volumes/Home/Photos Library.photoslibrary/" "时光旅客"
 ./impt.sh "/Volumes/Home/MyPhoto" "婚礼宾客"
-
+# 只要人脸不要车牌
+VI_VIDEO=1 VI_VPLATES=0 ./impt.sh "/Volumes/Home/MyPhoto" "婚礼宾"
 
 # 等价于：./bin/vi importfaces -dir ~/Photos/婚礼 -label 婚礼
 
