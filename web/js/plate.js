@@ -137,23 +137,30 @@ class PlateEngine {
       const h = data[o + 3] / ratio;
       if (w < 12 || h < 4 || w > vw * 1.1) continue;
       const box = { x: cx - w / 2, y: cy - h / 2, w, h, score: conf };
+      // 输出 15 维 = cx,cy,w,h,conf + 4 个角点(8) + 单层/双层分类分(2)。
+      // 只有前 4 个角点是关键点；第 5 组是分类分（如 1.0, 0.0），
+      // 当成坐标会把框撑到整幅画面，导致裁剪区域完全错误、识别不出车牌。
       const pts = [];
-      for (let k = 0; k < 5; k++) {
-        pts.push([
-          (data[o + 5 + k * 2] - dw) / ratio,
-          (data[o + 6 + k * 2] - dh) / ratio
-        ]);
+      for (let k = 0; k < 4; k++) {
+        const kx = data[o + 5 + k * 2], ky = data[o + 6 + k * 2];
+        // 无效角点模型输出 ≈(0,0)，必须丢弃
+        if (kx <= 1 && ky <= 1) continue;
+        const px = (kx - dw) / ratio, py = (ky - dh) / ratio;
+        if (!Number.isFinite(px) || !Number.isFinite(py)) continue;
+        pts.push([px, py]);
       }
-      let minX = vw, minY = vh, maxX = 0, maxY = 0;
-      for (const [x, y] of pts) {
-        minX = Math.min(minX, x); maxX = Math.max(maxX, x);
-        minY = Math.min(minY, y); maxY = Math.max(maxY, y);
-      }
-      if (maxX - minX > 4 && maxY - minY > 2) {
-        box.x = Math.max(0, minX);
-        box.y = Math.max(0, minY);
-        box.w = Math.min(vw - box.x, maxX - minX);
-        box.h = Math.min(vh - box.y, maxY - minY);
+      if (pts.length >= 4) {
+        let minX = vw, minY = vh, maxX = 0, maxY = 0;
+        for (const [x, y] of pts) {
+          minX = Math.min(minX, x); maxX = Math.max(maxX, x);
+          minY = Math.min(minY, y); maxY = Math.max(maxY, y);
+        }
+        if (maxX - minX > 4 && maxY - minY > 2) {
+          box.x = Math.max(0, minX);
+          box.y = Math.max(0, minY);
+          box.w = Math.min(vw - box.x, maxX - minX);
+          box.h = Math.min(vh - box.y, maxY - minY);
+        }
       }
       box.x = Math.max(0, box.x);
       box.y = Math.max(0, box.y);

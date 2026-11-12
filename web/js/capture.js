@@ -255,8 +255,11 @@ async function faceLoop() {
   }
 }
 
-// 车牌循环：rAF 驱动，每 5 帧评估一次；画面基本静止（帧差极小）直接跳过推理。
+// 车牌循环：rAF 驱动，每 5 帧评估一次；画面静止时降频，但至少每秒评估一次，
+// 否则静止的车牌（停车、镜头不动）会在启动那一帧之后被永久跳过。
 let plateFrame = 0;
+let lastPlateEval = 0;
+const PLATE_IDLE_MS = 1000;
 const diffCanvas = new OffscreenCanvas(96, 54);
 const diffCtx = diffCanvas.getContext('2d', { willReadFrequently: true });
 let prevFrame = null;
@@ -276,18 +279,30 @@ async function plateLoop() {
   if (state.busyPlate || !state.plate || !video.videoWidth) return;
   plateFrame++;
   if (plateFrame % 5 !== 0) return;
-  if (!frameChanged()) return;
+  const now = performance.now();
+  const mustEval = now - lastPlateEval >= PLATE_IDLE_MS;
+  if (!mustEval && !frameChanged()) return;
+  lastPlateEval = now;
   state.busyPlate = true;
   try {
     const results = await state.plate.detectAndRecognize(video);
     state.plateBoxes = results.map(r => r.box);
     for (const r of results) {
       const key = r.text;
-      const last = state.plateLast.get(key) || 0;
-      if (performance.now() - last < 120000) continue;
+      const last = state.plateLast.get(key);
+      // 没记录过时 last 为 undefined，不能当成 0，否则 performance.now()-0 < 120000
+      // 会让页面打开后的前 2 分钟里所有车牌都被当成“刚上传过”而跳过
+      if (last && now - last < 120000) continue;
       if (r.conf < 0.18) continue;
-      state.plateLast.set(key, performance.now());
-      await uploadPlate(r.crop, r.text, r.conf);
+      try {
+        await uploadPlate(r.crop, r.text, r.conf);
+        // 只有上传成功才记入去重表，避免一次失败后 2 分钟内不再重试
+        state.plateLast.set(key, performance.now());
+      } catch (e) {
+        // 不再静默：把识别结果和后端拒绝原因显示出来
+        console.warn('plate upload', r.text, e);
+        toast(`车牌 ${r.text} 上传失败：${e.message || e}`, 'err', 5000);
+      }
     }
   } catch (e) {
     console.warn('plate loop', e);
