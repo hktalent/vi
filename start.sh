@@ -1,3 +1,5 @@
 #!/usr/bin/env bash
-tmux new -s vi './start0.sh; exec ${SHELL:-zsh}'
+tmux new -d -A -s vi -c $PWD './start0.sh; exec zsh'
+
+
 
