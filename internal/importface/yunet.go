@@ -100,30 +100,40 @@ func (d *YuNetDetector) Detect(img gocv.Mat) []YuFace {
 		rows := inH / stride
 		n := rows * cols
 
-		cls := outs[si].Reshape(1, n)         // n×1
-		obj := outs[si+3].Reshape(1, n)       // n×1
-		bbox := outs[si+6].Reshape(1, n)      // n×4
-		kps := outs[si+9].Reshape(1, n)       // n×10
+		cls := outs[si].Reshape(1, n)    // n×1
+		obj := outs[si+3].Reshape(1, n)  // n×1
+		bbox := outs[si+6].Reshape(1, n) // n×4
+		kps := outs[si+9].Reshape(1, n)  // n×10
 		clsC, objC, bboxC, kpsC := cls, obj, bbox, kps
 		defer clsC.Close()
 		defer objC.Close()
 		defer bboxC.Close()
 		defer kpsC.Close()
 
+		// 一次性取连续内存：原来每个 cell 用 GetFloatAt 取值，
+		// 1280×1280 输入下是每张图 6 万多次 cgo 调用（实测 YuNet 阶段 8.9ms，大部分耗在这里）
+		clsF, cerr1 := clsC.DataPtrFloat32()
+		objF, cerr2 := objC.DataPtrFloat32()
+		bboxF, cerr3 := bboxC.DataPtrFloat32()
+		kpsF, cerr4 := kpsC.DataPtrFloat32()
+		if cerr1 != nil || cerr2 != nil || cerr3 != nil || cerr4 != nil {
+			continue
+		}
 		for r := 0; r < rows; r++ {
 			for c := 0; c < cols; c++ {
 				idx := r*cols + c
-				clsScore := clamp(cls.GetFloatAt(idx, 0), 0, 1)
-				objScore := clamp(obj.GetFloatAt(idx, 0), 0, 1)
+				clsScore := clamp(clsF[idx], 0, 1)
+				objScore := clamp(objF[idx], 0, 1)
 				score := float32(math.Sqrt(float64(clsScore * objScore)))
 				if score < yuScoreThreshold {
 					continue
 				}
 				// bbox 解码（输入图坐标）
-				cx := (float64(c) + float64(bbox.GetFloatAt(idx, 0))) * float64(stride)
-				cy := (float64(r) + float64(bbox.GetFloatAt(idx, 1))) * float64(stride)
-				w := math.Exp(float64(bbox.GetFloatAt(idx, 2))) * float64(stride)
-				h := math.Exp(float64(bbox.GetFloatAt(idx, 3))) * float64(stride)
+				b := bboxF[idx*4 : idx*4+4]
+				cx := (float64(c) + float64(b[0])) * float64(stride)
+				cy := (float64(r) + float64(b[1])) * float64(stride)
+				w := math.Exp(float64(b[2])) * float64(stride)
+				h := math.Exp(float64(b[3])) * float64(stride)
 				// 还原到原图坐标
 				x1 := int(math.Round((cx - w/2) * invX))
 				y1 := int(math.Round((cy - h/2) * invY))
@@ -134,9 +144,10 @@ func (d *YuNetDetector) Detect(img gocv.Mat) []YuFace {
 					continue
 				}
 				var lm [5][2]float32
+				kp := kpsF[idx*10 : idx*10+10]
 				for k := 0; k < 5; k++ {
-					lx := (float64(kps.GetFloatAt(idx, 2*k)) + float64(c)) * float64(stride)
-					ly := (float64(kps.GetFloatAt(idx, 2*k+1)) + float64(r)) * float64(stride)
+					lx := (float64(kp[2*k]) + float64(c)) * float64(stride)
+					ly := (float64(kp[2*k+1]) + float64(r)) * float64(stride)
 					lm[k] = [2]float32{float32(lx * invX), float32(ly * invY)}
 				}
 				faces = append(faces, YuFace{Rect: rect, Score: score, Landmarks: lm})
@@ -178,7 +189,7 @@ func rectIoU(a, b image.Rectangle) float64 {
 		return 0
 	}
 	ia := float64(inter.Dx() * inter.Dy())
-	ua := float64(a.Dx()*a.Dy() + b.Dx()*b.Dy()) - ia
+	ua := float64(a.Dx()*a.Dy()+b.Dx()*b.Dy()) - ia
 	if ua <= 0 {
 		return 0
 	}
@@ -200,16 +211,17 @@ func clamp(v float32, lo, hi float32) float32 {
 //
 // YuNet 输出 5 个点：右眼中心、左眼中心、鼻尖、右嘴角、左嘴角
 // 通过 CheckQuality 的条件（10 项全过才算完整五官）：
-//   A. YuNet Score ≥ 0.75
-//   B. 双眼水平距离 / 脸宽 ∈ [12%, 55%]
-//   C. 双眼垂直倾斜 / 脸高 ≤ 30%
-//   D. 鼻尖 x ∈ 双眼区间 ± 20%
-//   E. MAR（嘴巴张合度）∈ [0.05, 0.45]
-//   F. 嘴巴水平宽度 ≥ 12% 脸宽
-//   G. 嘴巴中心 y ∈ [鼻尖+5%, 鼻尖+40%] faceH
-//   H. 所有 5 个 landmark 在脸 bbox ±5% 内
-//   I. 双眼 landmark 附近 Haar eye cascade 必须能检测到（闭眼拦截）
-//   J. YuNet bbox 左右各留 ≥ 15% faceW 的耳朵空间（侧脸耳朵被裁 → 过不了）
+//
+//	A. YuNet Score ≥ 0.75
+//	B. 双眼水平距离 / 脸宽 ∈ [12%, 55%]
+//	C. 双眼垂直倾斜 / 脸高 ≤ 30%
+//	D. 鼻尖 x ∈ 双眼区间 ± 20%
+//	E. MAR（嘴巴张合度）∈ [0.05, 0.45]
+//	F. 嘴巴水平宽度 ≥ 12% 脸宽
+//	G. 嘴巴中心 y ∈ [鼻尖+5%, 鼻尖+40%] faceH
+//	H. 所有 5 个 landmark 在脸 bbox ±5% 内
+//	I. 双眼 landmark 附近 Haar eye cascade 必须能检测到（闭眼拦截）
+//	J. YuNet bbox 左右各留 ≥ 15% faceW 的耳朵空间（侧脸耳朵被裁 → 过不了）
 type FaceChecker struct {
 	yunet      *YuNetDetector
 	eyeCascade *gocv.CascadeClassifier // eye_tree_eyeglasses 或 eye.xml

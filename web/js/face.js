@@ -72,6 +72,12 @@ class FaceEngine {
     this.alignCtx = this.alignCanvas.getContext('2d', { willReadFrequently: true });
     this.attrCanvas = new OffscreenCanvas(224, 224);
     this.attrCtx = this.attrCanvas.getContext('2d', { willReadFrequently: true });
+    // 肤色检测用小画布：每帧每张脸都 new OffscreenCanvas 是主要的 GC 抖动源
+    this.skinCanvas = new OffscreenCanvas(64, 64);
+    this.skinCtx = this.skinCanvas.getContext('2d', { willReadFrequently: true });
+    // 上传用的裁剪画布：toBlob 在调用瞬间就快照位图，轮转两张即可安全复用
+    this.cropPool = [];
+    this.cropIdx = 0;
     this.lastTs = -1;
     this.provider = '';
   }
@@ -235,10 +241,6 @@ class FaceEngine {
 
     for (const landmarks of all) {
       const five = this.fivePoints(landmarks, vw, vh);
-      const t = estimateSimilarity(five, FACE_REF);
-      this.alignCtx.setTransform(t.a, t.b, -t.b, t.a, t.tx, t.ty);
-      this.alignCtx.drawImage(video, 0, 0, vw, vh);
-      this.alignCtx.setTransform(1, 0, 0, 1, 0, 0);
 
       let minX = vw, minY = vh, maxX = 0, maxY = 0;
       for (const l of landmarks) {
@@ -249,6 +251,7 @@ class FaceEngine {
         if (y > maxY) maxY = y;
       }
       const fw = maxX - minX, fh = maxY - minY;
+      if (fw < 16 || fh < 16) continue;
       const padX = fw * 0.22, padY = fh * 0.28;
       const box = {
         x: Math.max(0, minX - padX),
@@ -257,28 +260,40 @@ class FaceEngine {
         h: Math.min(vh - Math.max(0, minY - padY), fh + padY * 2)
       };
 
-      // 对齐结果快照，供低频的 embedding/属性推理使用（detect 本身只做检测+对齐）
-      const snap = new OffscreenCanvas(112, 112);
-      snap.getContext('2d').drawImage(this.alignCanvas, 0, 0);
-
       // 肤色检测：过滤误检（领带、花朵、布料等无肤色区域）
       if (!this._hasSkinTone(video, box)) continue;
 
-      out.push({ box, snap });
+      // 只返回框与 5 点：对齐图仅在真正要推理时才生成（每 track 约 3s 一次），
+      // 原来每帧每张脸都要 drawImage + 新建 112×112 canvas，是逐帧的主要开销之一
+      out.push({ box, five });
     }
     return out;
   }
 
-  // _hasSkinTone 检查裁剪区域中肤色像素比例（RGB 简化判断，避免 HSV 转换开销）
+  // align 把 5 点对齐到 112×112，返回复用的对齐画布。
+  // 调用方必须立刻消费（embed/attributes）；推理队列是串行的，因此单画布安全。
+  align(video, five) {
+    const t = estimateSimilarity(five, FACE_REF);
+    const ctx = this.alignCtx;
+    ctx.setTransform(t.a, t.b, -t.b, t.a, t.tx, t.ty);
+    ctx.drawImage(video, 0, 0, video.videoWidth, video.videoHeight);
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    return this.alignCanvas;
+  }
+
+  // _hasSkinTone 检查裁剪区域中肤色像素比例（RGB 简化判断，避免 HSV 转换开销）。
+  // 缩到 64×64 再统计：判定是"比例"阈值，分辨率对结果几乎无影响，但像素量降到 1/N。
   _hasSkinTone(video, box) {
     const { x, y, w, h } = box;
     if (w < 20 || h < 20) return false;
-    const canvas = new OffscreenCanvas(w, h);
-    const ctx = canvas.getContext('2d');
-    ctx.drawImage(video, x, y, w, h, 0, 0, w, h);
-    const data = ctx.getImageData(0, 0, w, h).data;
+    const sw = 64, sh = Math.max(16, Math.min(64, Math.round(64 * h / w)));
+    const canvas = this.skinCanvas;
+    if (canvas.width !== sw || canvas.height !== sh) { canvas.width = sw; canvas.height = sh; }
+    const ctx = this.skinCtx;
+    ctx.drawImage(video, x, y, w, h, 0, 0, sw, sh);
+    const data = ctx.getImageData(0, 0, sw, sh).data;
     let skinCount = 0;
-    const total = w * h;
+    const total = sw * sh;
     for (let i = 0; i < data.length; i += 4) {
       const r = data[i], g = data[i + 1], b = data[i + 2];
       // RGB 肤色近似判断：R > G > B 且有一定饱和度
@@ -342,7 +357,11 @@ class FaceEngine {
   }
 
   crop(video, box, maxW = 320) {
-    const canvas = document.createElement('canvas');
+    // 轮转复用两张 canvas：toBlob 在调用瞬间快照位图，轮转可避免同时被两次上传引用
+    if (this.cropPool.length < 2) {
+      this.cropPool.push(document.createElement('canvas'));
+    }
+    const canvas = this.cropPool[this.cropIdx++ % this.cropPool.length];
     const scale = Math.min(1, maxW / Math.max(1, box.w));
     canvas.width = Math.max(32, Math.round(box.w * scale));
     canvas.height = Math.max(32, Math.round(box.h * scale));

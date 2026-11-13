@@ -85,6 +85,9 @@ func main() {
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
 		case "serve":
+			// flag.Parse 遇到第一个非 flag 参数就停（"serve" 本身），
+			// 先把子命令摘掉，"vi serve -addr ..." 这类写法才真正生效
+			os.Args = append(os.Args[:1], os.Args[2:]...)
 			os.Exit(runServe())
 		case "importfaces", "import":
 			os.Exit(runImportFaces(os.Args[2:]))
@@ -171,9 +174,17 @@ func runServe() int {
 	// ✅ 高清增强：人脸抠图异步增强（×3 放大→锐化→还原原尺寸→覆盖原文件）
 	enh := imgenh.New(cfg.DataDir)
 
-	srv := api.NewServer(cfg, st, fc, enh)
+	handler := api.NewServer(cfg, st, fc, enh)
 	log.Printf("vi 已启动: http://%s  (人脸阈值 %.2f, 冷却 %s)", cfg.Addr, cfg.FaceThresh, cfg.Cooldown)
-	if err := http.ListenAndServe(cfg.Addr, srv); err != nil {
+	// 显式超时：避免慢客户端/半开连接长期占住 goroutine，也防 Slowloris 类占用
+	httpSrv := &http.Server{
+		Addr:              cfg.Addr,
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       90 * time.Second,
+		MaxHeaderBytes:    1 << 20,
+	}
+	if err := httpSrv.ListenAndServe(); err != nil {
 		log.Fatal(err)
 	}
 	return 0

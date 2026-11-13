@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -48,7 +49,7 @@ func WGS84ToGCJ02(lng, lat float64) (float64, float64) {
 	magic := math.Sin(radLat)
 	magic = 1 - ee*magic*magic
 	sqrtMagic := math.Sqrt(magic)
-	dLat = (dLat * 180.0) / ((a * (1 - ee)) / (magic*sqrtMagic) * math.Pi)
+	dLat = (dLat * 180.0) / ((a * (1 - ee)) / (magic * sqrtMagic) * math.Pi)
 	dLng = (dLng * 180.0) / (a / sqrtMagic * math.Cos(radLat) * math.Pi)
 	return lng + dLng, lat + dLat
 }
@@ -56,30 +57,33 @@ func WGS84ToGCJ02(lng, lat float64) (float64, float64) {
 // cachedAddr 是一条缓存记录：地址 + 写入时间 + 是否为"不好"的 fallback（纯经纬度字符串）
 type cachedAddr struct {
 	Addr string `json:"addr"`
-	At   int64  `json:"at"`   // Unix 秒
-	Bad  bool   `json:"bad"`  // true = 是 fallback 经纬度/空地址，有高德 key 时应强制刷新
-	Src  string `json:"src"`  // amap | openmeteo | fallback
+	At   int64  `json:"at"`  // Unix 秒
+	Bad  bool   `json:"bad"` // true = 是 fallback 经纬度/空地址，有高德 key 时应强制刷新
+	Src  string `json:"src"` // amap | openmeteo | fallback
 }
 
 // Geocoder 调用逆地理编码服务，把经纬度转换为中文地址，并做本地缓存。
 // 优先走高德（AMAP），国内坐标更准；没配 AMAP key 时回退 Open-Meteo。
 type Geocoder struct {
-	base    string
-	amapKey string
-	cli     *http.Client
-	file    string
-	mu      sync.Mutex
-	cache   map[string]cachedAddr
-	dirty   bool
+	base       string
+	amapKey    string
+	cli        *http.Client
+	file       string
+	mu         sync.Mutex
+	cache      map[string]cachedAddr
+	dirty      bool
+	inflight   map[string]chan struct{} // 同一坐标只发起一次请求（singleflight）
+	flushTimer *time.Timer              // 落盘防抖，避免每次未命中都重写整份缓存
 }
 
 func NewGeocoder(base, amapKey, file string) *Geocoder {
 	g := &Geocoder{
-		base:    base,
-		amapKey: amapKey,
-		file:    file,
-		cli:     &http.Client{Timeout: 6 * time.Second},
-		cache:   map[string]cachedAddr{},
+		base:     base,
+		amapKey:  amapKey,
+		file:     file,
+		cli:      &http.Client{Timeout: 6 * time.Second},
+		cache:    map[string]cachedAddr{},
+		inflight: map[string]chan struct{}{},
 	}
 	if b, err := os.ReadFile(file); err == nil {
 		// 兼容旧格式：map[string]string
@@ -128,45 +132,158 @@ func geoKey(lat, lon float64) string {
 	return fmt.Sprintf("%.3f,%.3f", lat, lon)
 }
 
-// Reverse 返回地址；服务不可用时退化为经纬度字符串，保证采集不中断。
+// Reverse 返回地址（阻塞，最多等 6s）。批量导入等可容忍延迟的路径用它。
 func (g *Geocoder) Reverse(lat, lon *float64) string {
+	return g.ReverseTimeout(lat, lon, 6*time.Second)
+}
+
+// ReverseTimeout 是采集请求路径用的版本：先查缓存（含邻近缓存），
+// 未命中则在后台发起一次请求（同坐标 singleflight 合并），最多等待 wait 才返回。
+// wait=0 表示完全不阻塞，立刻返回缓存/空串。
+func (g *Geocoder) ReverseTimeout(lat, lon *float64, wait time.Duration) string {
 	if lat == nil || lon == nil {
 		return ""
 	}
 	key := geoKey(*lat, *lon)
 
-	// 缓存命中且不是 bad（经纬度 fallback）→ 直接返回
-	// 如果有高德 key 且缓存标记为 bad → 强制刷新（旧 Open-Meteo 结果换高德）
-	g.mu.Lock()
-	if v, ok := g.cache[key]; ok {
-		forceRefresh := v.Bad && g.amapKey != ""
-		if !forceRefresh {
-			g.mu.Unlock()
-			return v.Addr
+	if addr, ok := g.look(key, *lat, *lon, false); ok {
+		return addr
+	}
+	nearAddr, hasNear := g.look(key, *lat, *lon, true)
+	ch, existed := g.start(key, *lat, *lon)
+
+	// 全新坐标、没有人预热、也没有邻近缓存 → 立刻返回空，把解析完全放到后台。
+	// 这是采集路径的关键：宁可比对精度晚一拍，也不要让请求卡在网络往返上。
+	if !existed && !hasNear {
+		return ""
+	}
+	if wait > 0 {
+		t := time.NewTimer(wait)
+		select {
+		case <-ch:
+			t.Stop()
+			if addr, ok := g.look(key, *lat, *lon, false); ok {
+				return addr
+			}
+		case <-t.C:
 		}
-		log.Printf("[geo] 缓存是 fallback 经纬度，有高德 key，强制刷新: %s", key)
 	}
-	g.mu.Unlock()
+	// 还没解析完：先用同街区的邻近缓存（GPS 抖动/新街区首次采集）
+	return nearAddr
+}
 
-	addr, src := g.fetch(*lat, *lon)
-	bad := addr == "" || isFallbackAddr(addr)
-	if bad && addr == "" {
-		addr = fmt.Sprintf("%.5f,%.5f", *lat, *lon)
+// Remember 把外部（前端）已解析好的地址写入缓存，省掉一次网络请求。
+// 只接受看起来像真实地址的字符串，避免把经纬度 fallback 写进缓存。
+func (g *Geocoder) Remember(lat, lon *float64, addr, src string) {
+	addr = strings.TrimSpace(addr)
+	if lat == nil || lon == nil || addr == "" || isFallbackAddr(addr) {
+		return
 	}
-
+	key := geoKey(*lat, *lon)
 	g.mu.Lock()
-	g.cache[key] = cachedAddr{Addr: addr, At: time.Now().Unix(), Bad: bad, Src: src}
+	if v, ok := g.cache[key]; ok && v.Addr == addr {
+		g.mu.Unlock()
+		return
+	}
+	g.cache[key] = cachedAddr{Addr: addr, At: time.Now().Unix(), Src: src}
 	g.dirty = true
 	g.mu.Unlock()
-	g.flush()
+	g.flushDebounced()
+}
 
-	latStr, lonStr := fmt.Sprintf("%.5f", *lat), fmt.Sprintf("%.5f", *lon)
-	if bad {
-		log.Printf("[geo] [%s] 逆地理编码返回 fallback: %s (%s, %s)", src, addr, latStr, lonStr)
-	} else {
-		log.Printf("[geo] [%s] %s ← (%s, %s)", src, addr, latStr, lonStr)
+// look 查缓存。nearest=true 时允许返回 ~2km 内的邻近缓存（GPS 抖动/新街区首次采集用）。
+func (g *Geocoder) look(key string, lat, lon float64, nearest bool) (string, bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if v, ok := g.cache[key]; ok && !v.Bad && v.Addr != "" {
+		return v.Addr, true
 	}
-	return addr
+	if !nearest {
+		return "", false
+	}
+	bestD, best := math.MaxFloat64, ""
+	for k, v := range g.cache {
+		if v.Bad || v.Addr == "" {
+			continue
+		}
+		la, lo, ok := parseGeoKey(k)
+		if !ok {
+			continue
+		}
+		d := math.Abs(la-lat) + math.Abs(lo-lon)
+		if d < bestD {
+			bestD, best = d, v.Addr
+		}
+	}
+	if best != "" && bestD <= 0.02 {
+		return best, true
+	}
+	return "", false
+}
+
+// start 发起一次后台解析（同 key 只发一次），返回完成信号 channel 与"是否已有在途请求"。
+func (g *Geocoder) start(key string, lat, lon float64) (chan struct{}, bool) {
+	g.mu.Lock()
+	if ch, ok := g.inflight[key]; ok {
+		g.mu.Unlock()
+		return ch, true
+	}
+	ch := make(chan struct{})
+	g.inflight[key] = ch
+	g.mu.Unlock()
+
+	go func() {
+		addr, src := g.fetch(lat, lon)
+		bad := addr == "" || isFallbackAddr(addr)
+		if addr == "" {
+			addr = fmt.Sprintf("%.5f,%.5f", lat, lon)
+		}
+		g.mu.Lock()
+		g.cache[key] = cachedAddr{Addr: addr, At: time.Now().Unix(), Bad: bad, Src: src}
+		g.dirty = true
+		delete(g.inflight, key)
+		g.mu.Unlock()
+		close(ch)
+		g.flushDebounced()
+
+		latStr, lonStr := fmt.Sprintf("%.5f", lat), fmt.Sprintf("%.5f", lon)
+		if bad {
+			log.Printf("[geo] [%s] 逆地理编码返回 fallback: %s (%s, %s)", src, addr, latStr, lonStr)
+		} else {
+			log.Printf("[geo] [%s] %s ← (%s, %s)", src, addr, latStr, lonStr)
+		}
+	}()
+	return ch, false
+}
+
+// flushDebounced 把缓存落盘改为防抖：5s 内多次未命中合并成一次整份写入。
+func (g *Geocoder) flushDebounced() {
+	g.mu.Lock()
+	if g.flushTimer != nil {
+		g.mu.Unlock()
+		return
+	}
+	g.flushTimer = time.AfterFunc(5*time.Second, func() {
+		g.mu.Lock()
+		g.flushTimer = nil
+		g.mu.Unlock()
+		g.flush()
+	})
+	g.mu.Unlock()
+}
+
+// parseGeoKey 解析 "lat,lon" 形式的缓存 key。
+func parseGeoKey(k string) (float64, float64, bool) {
+	parts := strings.Split(k, ",")
+	if len(parts) != 2 {
+		return 0, 0, false
+	}
+	la, err1 := strconv.ParseFloat(strings.TrimSpace(parts[0]), 64)
+	lo, err2 := strconv.ParseFloat(strings.TrimSpace(parts[1]), 64)
+	if err1 != nil || err2 != nil {
+		return 0, 0, false
+	}
+	return la, lo, true
 }
 
 // fetch 返回 (地址, 来源标识)

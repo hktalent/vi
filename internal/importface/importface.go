@@ -5,6 +5,8 @@ import (
 	"crypto/rand"
 	"fmt"
 	"image"
+	_ "image/jpeg" // 注册解码器：只读文件头判断尺寸，用于决定是否降采样解码
+	_ "image/png"
 	"io"
 	"log"
 	"math"
@@ -24,28 +26,29 @@ import (
 
 // Importer 把本地文件夹里的图片扫描一遍，检测人脸 → 裁剪 → 提取 embedding → upsert 到 Qdrant。
 type Importer struct {
-	cfg        config.Config
-	qd         *qdrant.Qdrant
-	st         *store.Store
-	yunet      *YuNetDetector          // 优先使用的 DNN 检测器（nil 时回退 Haar）
-	cascade    *gocv.CascadeClassifier
-	cascadeAlt *gocv.CascadeClassifier // 第二投票 cascade
-	cascadeAlt2 *gocv.CascadeClassifier // 第三投票 cascade
-	eyeCascade  *gocv.CascadeClassifier // 眼睛（含戴眼镜）
+	cfg          config.Config
+	qd           *qdrant.Qdrant
+	st           *store.Store
+	yunet        *YuNetDetector // 优先使用的 DNN 检测器（nil 时回退 Haar）
+	cascade      *gocv.CascadeClassifier
+	cascadeAlt   *gocv.CascadeClassifier // 第二投票 cascade
+	cascadeAlt2  *gocv.CascadeClassifier // 第三投票 cascade
+	eyeCascade   *gocv.CascadeClassifier // 眼睛（含戴眼镜）
 	mouthCascade *gocv.CascadeClassifier // 嘴巴/微笑
-	net         *gocv.Net
-	label      string // 可选标签，作为每张新脸的 PersonID 前缀
-	dryRun     bool
-	force       bool              // 强制重新导入（忽略已有记录）
-	faceThresh  float64           // 人脸相似度阈值（Qdrant 搜索用，保持 0.45 召回率优先）
-	batchThresh float64           // 批次内同人匹配阈值（更高，避免不同人被错误合并）
-	existing    map[string]bool   // 已导入的 person_id 集合（幂等去重）
-	seen        []seenFace        // 本次 Run 内已见过的人脸向量+personID（批次内同人去重）
-	skipped     int               // 跳过数量统计
-	filtered    int               // 被 norm / 侧脸 / 五官不全过滤丢弃的数量统计
-	enh         *imgenh.Enhancer  // 异步高清增强（nil=不增强）
-	video       VideoOptions      // 视频导入选项（Enabled=false 时只扫图片）
-	plate       *PlateEngine      // 车牌引擎（视频且启用车牌时加载）
+	net          *gocv.Net
+	label        string // 可选标签，作为每张新脸的 PersonID 前缀
+	dryRun       bool
+	force        bool             // 强制重新导入（忽略已有记录）
+	faceThresh   float64          // 人脸相似度阈值（Qdrant 搜索用，保持 0.45 召回率优先）
+	batchThresh  float64          // 批次内同人匹配阈值（更高，避免不同人被错误合并）
+	existing     map[string]bool  // 已导入的 person_id 集合（幂等去重）
+	seen         []seenFace       // 本次 Run 内已见过的人脸向量+personID（批次内同人去重）
+	skipped      int              // 跳过数量统计
+	filtered     int              // 被 norm / 侧脸 / 五官不全过滤丢弃的数量统计
+	enh          *imgenh.Enhancer // 异步高清增强（nil=不增强）
+	video        VideoOptions     // 视频导入选项（Enabled=false 时只扫图片）
+	plate        *PlateEngine     // 车牌引擎（视频且启用车牌时加载）
+	verbose      bool             // 少量图片时逐张打日志；大批量只打汇总，避免日志 I/O 拖慢导入
 }
 
 // VideoOptions 控制 MOV/MP4 等视频的导入行为。
@@ -233,8 +236,16 @@ func (im *Importer) Run(dir string) (int, error) {
 
 	success, failed := 0, 0
 	var firstErr error
+	// 大批量导入时逐张日志（每张 1~2 行 + stderr 进度）会成为可观的开销，改为每 10 张刷新一次
+	im.verbose = len(imagePaths) <= 50
+	progressEvery := 1
+	if len(imagePaths) > 50 {
+		progressEvery = 10
+	}
 	for i, p := range imagePaths {
-		fmt.Fprintf(os.Stderr, "\r[%d/%d] %s", i+1, len(imagePaths), filepath.Base(p))
+		if im.verbose || (i+1)%progressEvery == 0 {
+			fmt.Fprintf(os.Stderr, "\r[%d/%d] %s", i+1, len(imagePaths), filepath.Base(p))
+		}
 		faces, _, err := im.processImage(p)
 		if err != nil {
 			failed++
@@ -288,7 +299,7 @@ type faceSrcMeta struct {
 
 // processImage 处理一张图片：检测所有人脸 → embedding 去重 → 保存。
 func (im *Importer) processImage(path string) (int, int, error) {
-	img := gocv.IMRead(path, gocv.IMReadColor)
+	img := readImageMat(path)
 	if img.Empty() {
 		return 0, 0, fmt.Errorf("无法读取")
 	}
@@ -298,8 +309,8 @@ func (im *Importer) processImage(path string) (int, int, error) {
 	meta := faceSrcMeta{srcPath: path, info: exif.Parse(path)}
 	saved, filteredThisImg, detections := im.importFacesFromMat(img, meta)
 
-	// ✅ 真正可信的日志：原始检测 / 通过五官 / 被过滤
-	if detections > 0 {
+	// ✅ 真正可信的日志：原始检测 / 通过五官 / 被过滤（大批量导入只在有过滤/异常时打）
+	if detections > 0 && (im.verbose || filteredThisImg > 0) {
 		p := filepath.Base(path)
 		switch {
 		case saved > 0 && filteredThisImg > 0:
@@ -311,6 +322,29 @@ func (im *Importer) processImage(path string) (int, int, error) {
 		}
 	}
 	return saved, filteredThisImg, nil
+}
+
+// readImageMat 解码图片。手机/相机原图（长边 > 2400）用 1/2 降采样解码：
+// 后续检测最长边最多 1280、embedding 112×112、抠图 160×160，
+// 全分辨率解码只是多花 4 倍像素的解码与内存开销，对识别结果没有影响。
+func readImageMat(path string) gocv.Mat {
+	if f, err := os.Open(path); err == nil {
+		cfg, _, cerr := image.DecodeConfig(f)
+		f.Close()
+		if cerr == nil && max(cfg.Width, cfg.Height) > 2400 {
+			return gocv.IMRead(path, gocv.IMReadReducedColor2)
+		}
+	}
+	return gocv.IMRead(path, gocv.IMReadColor)
+}
+
+// ReadImageMat 导出 readImageMat，供基准/诊断工具复用同一套解码策略。
+func ReadImageMat(path string) gocv.Mat { return readImageMat(path) }
+
+// EmbedWithNet 用外部 net 对 img 的 rect 区域提取 512 维特征（与导入链路同一实现）。
+func EmbedWithNet(net *gocv.Net, img gocv.Mat, r image.Rectangle) ([]float32, error) {
+	im := &Importer{net: net}
+	return im.extractEmbedding(img.Region(r))
 }
 
 // importFacesFromMat 在已解码的一帧画面上做人脸检测 → 质量验证 → 去重 → 落盘 → 写事件。
@@ -632,6 +666,17 @@ func matToFloat32(m gocv.Mat) ([]float32, error) {
 	if total > 100000 {
 		return nil, fmt.Errorf("embedding 维度异常: %d×%d", rows, cols)
 	}
+	if total == 0 {
+		return nil, fmt.Errorf("mat 为空")
+	}
+	// 一次性取连续内存：原来逐元素 GetFloatAt 是 512 次 cgo 调用，是每张人脸固定开销
+	if m.IsContinuous() && m.Type()&gocv.MatTypeCV32F == gocv.MatTypeCV32F {
+		if data, err := m.DataPtrFloat32(); err == nil && len(data) >= total {
+			vec := make([]float32, total)
+			copy(vec, data[:total])
+			return vec, nil
+		}
+	}
 	vec := make([]float32, 0, total)
 	for r := 0; r < rows; r++ {
 		for c := 0; c < cols; c++ {
@@ -778,10 +823,10 @@ func hasSkinTone(crop gocv.Mat) bool {
 
 // hasFacialFeatures 用 Haar 级联矩形 + 几何约束 + 统计特征判断是否真脸。
 // 强化版本（相对旧版的 3 个关键改动）：
-//   1. MUST 有嘴巴：条件 1（成对眼睛）和条件 2（单眼）都要求 mouth cascade 命中。
-//      旧版条件 1 只要求眼睛成对就 return true → 花的两个对称花瓣没嘴巴也能蒙混 → 现在必须有嘴巴。
-//   2. 眼睛矩形宽高比 ≥ 1.5：真人眼睛是水平椭圆，花芯/纹理触发的矩形近正方形 w/h≈1.0 → reject。
-//   3. 花放射状拒：上半脸 eye cascade 返回 ≥ 5 个小框 → 花瓣对称放射触发的误检 → 直接 reject。
+//  1. MUST 有嘴巴：条件 1（成对眼睛）和条件 2（单眼）都要求 mouth cascade 命中。
+//     旧版条件 1 只要求眼睛成对就 return true → 花的两个对称花瓣没嘴巴也能蒙混 → 现在必须有嘴巴。
+//  2. 眼睛矩形宽高比 ≥ 1.5：真人眼睛是水平椭圆，花芯/纹理触发的矩形近正方形 w/h≈1.0 → reject。
+//  3. 花放射状拒：上半脸 eye cascade 返回 ≥ 5 个小框 → 花瓣对称放射触发的误检 → 直接 reject。
 func (im *Importer) hasFacialFeatures(crop gocv.Mat) bool {
 	faceW := float64(crop.Cols())
 	faceH := float64(crop.Rows())
@@ -888,16 +933,16 @@ func (im *Importer) hasFacialFeatures(crop gocv.Mat) bool {
 	return false
 }
 
-//   A. YuNet Score ≥ 0.62（手机糊脸集中 0.60-0.74，卡 0.62 放行真脸）
-//   B. 双眼水平距离 / 脸宽 ∈ [6%, 65%]（真实分布 p50=0.074，广角/近脸都会偏小）
-//   C. 双眼垂直倾斜 / 脸高 ≤ 40%
-//   D. 鼻尖 x ∈ 双眼区间 ±35%
-//   E. MAR ∈ [0.01, 0.55]（闭嘴脸 YuNet mouth landmark y 几乎重合 → MAR→0，下限 0.01）
-//   F. 嘴巴水平宽度 ≥ 6% 脸宽
-//   G. 嘴巴中心 y ∈ [鼻尖+3%, 鼻尖+48%] faceH
-//   H. 所有 5 个 landmark 在脸 bbox ±8% 内
-//   I. 闭眼拦截：score ≥ 0.72 跳 Haar；score < 0.72 则至少一只眼被 Haar 检出
-//   J. 耳朵空间：YuNet bbox 左右各留 ≥ 6% faceW（侧脸 < 3%，近脸 p50=13-14%）
+// A. YuNet Score ≥ 0.62（手机糊脸集中 0.60-0.74，卡 0.62 放行真脸）
+// B. 双眼水平距离 / 脸宽 ∈ [6%, 65%]（真实分布 p50=0.074，广角/近脸都会偏小）
+// C. 双眼垂直倾斜 / 脸高 ≤ 40%
+// D. 鼻尖 x ∈ 双眼区间 ±35%
+// E. MAR ∈ [0.01, 0.55]（闭嘴脸 YuNet mouth landmark y 几乎重合 → MAR→0，下限 0.01）
+// F. 嘴巴水平宽度 ≥ 6% 脸宽
+// G. 嘴巴中心 y ∈ [鼻尖+3%, 鼻尖+48%] faceH
+// H. 所有 5 个 landmark 在脸 bbox ±8% 内
+// I. 闭眼拦截：score ≥ 0.72 跳 Haar；score < 0.72 则至少一只眼被 Haar 检出
+// J. 耳朵空间：YuNet bbox 左右各留 ≥ 6% faceW（侧脸 < 3%，近脸 p50=13-14%）
 func (im *Importer) isQualityFace(f YuFace, img gocv.Mat) bool {
 	faceW := float32(f.Rect.Dx())
 	faceH := float32(f.Rect.Dy())

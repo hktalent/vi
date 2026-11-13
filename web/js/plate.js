@@ -98,6 +98,16 @@ class PlateEngine {
     }
   }
 
+  // 复用的 float32 缓冲：640×640×3 每帧要 4.9MB，逐帧新建会带来持续的 GC 压力。
+  // ORT proxy 模式有可能在 run 后把 buffer transfer 掉（byteLength 变 0），
+  // 因此每次使用前按 byteLength 校验，失效就重新分配——不做任何假设。
+  _floatBuf(need) {
+    if (!this._buf || this._buf.byteLength !== need * 4) {
+      this._buf = new Float32Array(need);
+    }
+    return this._buf;
+  }
+
   preprocess(video) {
     const vw = video.videoWidth, vh = video.videoHeight;
     const r = Math.min(DET_SIZE / vw, DET_SIZE / vh);
@@ -108,7 +118,7 @@ class PlateEngine {
     ctx.fillRect(0, 0, DET_SIZE, DET_SIZE);
     ctx.drawImage(video, dw, dh, nw, nh);
     const img = ctx.getImageData(0, 0, DET_SIZE, DET_SIZE).data;
-    const data = new Float32Array(1 * 3 * DET_SIZE * DET_SIZE);
+    const data = this._floatBuf(3 * DET_SIZE * DET_SIZE);
     const plane = DET_SIZE * DET_SIZE;
     for (let i = 0, p = 0; i < img.length; i += 4, p++) {
       data[p] = img[i] / 255;
@@ -180,13 +190,16 @@ class PlateEngine {
     let resizedW = Math.round(REC_H * ratio);
     resizedW = Math.max(20, Math.min(REC_W, resizedW));
 
-    const small = new OffscreenCanvas(resizedW, REC_H);
-    const sctx = small.getContext('2d', { willReadFrequently: true });
+    // 复用一张 REC_W×REC_H 画布：getImageData 是同步拷贝，取出后画布可立即复用
+    if (!this._recCanvas) this._recCanvas = new OffscreenCanvas(REC_W, REC_H);
+    const small = this._recCanvas;
+    if (!this._recCtx) this._recCtx = small.getContext('2d', { willReadFrequently: true });
+    const sctx = this._recCtx;
     sctx.drawImage(video, sx, sy, sw, sh, 0, 0, resizedW, REC_H);
     const img = sctx.getImageData(0, 0, resizedW, REC_H).data;
 
     const plane = REC_H * REC_W;
-    const data = new Float32Array(3 * plane);
+    const data = this._floatBuf2(3 * plane);
     for (let y = 0; y < REC_H; y++) {
       for (let x = 0; x < resizedW; x++) {
         const i = (y * resizedW + x) * 4;
@@ -203,6 +216,31 @@ class PlateEngine {
     crop.getContext('2d').drawImage(video, sx, sy, sw, sh, 0, 0, crop.width, crop.height);
 
     return { tensor: data, crop };
+  }
+
+  _floatBuf2(need) {
+    if (!this._recBuf || this._recBuf.byteLength !== need * 4) {
+      this._recBuf = new Float32Array(need);
+    }
+    return this._recBuf;
+  }
+
+  // _makeCrop 只产出上传用的裁剪画布（复用识别结果时也用它）
+  _makeCrop(video, box) {
+    const pad = Math.max(2, box.h * 0.08);
+    const sx = Math.max(0, box.x - pad), sy = Math.max(0, box.y - pad);
+    const sw = Math.min(video.videoWidth - sx, box.w + pad * 2);
+    const sh = Math.min(video.videoHeight - sy, box.h + pad * 2);
+    const crop = document.createElement('canvas');
+    crop.width = Math.max(48, Math.round(sw));
+    crop.height = Math.max(16, Math.round(sh));
+    crop.getContext('2d').drawImage(video, sx, sy, sw, sh, 0, 0, crop.width, crop.height);
+    return crop;
+  }
+
+  _boxKey(b) {
+    const g = 8;
+    return `${Math.round(b.x / g)}:${Math.round(b.y / g)}:${Math.round(b.w / g)}:${Math.round(b.h / g)}`;
   }
 
   async recognize(video, box) {
@@ -238,11 +276,27 @@ class PlateEngine {
 
   async detectAndRecognize(video) {
     const dets = await this.detect(video);
+    if (!this.recCache) this.recCache = new Map();
     const out = [];
     for (const d of dets.slice(0, 5)) {
       if (d.w < 24 || d.h < 8) continue;
+      const key = this._boxKey(d);
+      const hit = this.recCache.get(key);
+      // 静止场景（停车、红灯）里车牌框几乎不动：3s 内直接复用上一次识别文本，
+      // 省掉一次 rec 前向，也避免同一车牌每 200ms 重复计算
+      if (hit && performance.now() - hit.at < 3000) {
+        out.push({ text: hit.text, conf: hit.conf, crop: this._makeCrop(video, d), box: d });
+        continue;
+      }
       const r = await this.recognize(video, d);
-      if (r.text.length >= 5) out.push(r);
+      if (r.text.length >= 5) {
+        out.push(r);
+        this.recCache.set(key, { at: performance.now(), text: r.text, conf: r.conf });
+        if (this.recCache.size > 32) {
+          const oldest = this.recCache.keys().next().value;
+          this.recCache.delete(oldest);
+        }
+      }
     }
     return out;
   }

@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"vi/internal/auth"
@@ -31,6 +32,11 @@ type Server struct {
 	fc  *importface.FaceChecker // YuNet + Haar eye cascade，Web 采集时做完整五官验证（nil=不可用，跳过验证）
 	enh *imgenh.Enhancer        // 异步高清增强（nil=不增强）
 	mux *http.ServeMux
+
+	healthMu   sync.Mutex
+	healthAt   time.Time
+	healthBody map[string]any
+	healthQdOK bool
 }
 
 // NewServer 组装所有路由并返回一个 http.Handler。
@@ -81,15 +87,21 @@ func NewServer(cfg config.Config, st *store.Store, fc *importface.FaceChecker, e
 	s.mux.Handle("/models/", wrapCache(http.StripPrefix("/models/", models), "public, max-age=31536000, immutable"))
 	s.mux.Handle("/vendor/", wrapCache(http.StripPrefix("/vendor/", vendor), "public, max-age=31536000, immutable"))
 	s.mux.Handle("/reports/", http.StripPrefix("/reports/", reports))
-	s.mux.Handle("/", wrapCache(web, "public, max-age=60, must-revalidate"))
+	js := wrapCache(http.StripPrefix("/js/", http.FileServer(http.Dir(filepath.Join(cfg.WebDir, "js")))), "public, max-age=86400")
+	css := wrapCache(http.StripPrefix("/css/", http.FileServer(http.Dir(filepath.Join(cfg.WebDir, "css")))), "public, max-age=86400")
+	s.mux.Handle("/js/", js)
+	s.mux.Handle("/css/", css)
+	s.mux.Handle("/", wrapCache(web, "no-cache"))
 
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	coop := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h := w.Header()
 		h.Set("Cross-Origin-Opener-Policy", "same-origin")
 		h.Set("Cross-Origin-Embedder-Policy", "require-corp")
 		h.Set("Cross-Origin-Resource-Policy", "same-origin")
 		s.mux.ServeHTTP(w, r)
 	})
+	// 最外层做 gzip + ETag：文本响应体积与二次请求耗时都显著下降
+	return withCompression(coop)
 }
 
 // wrapCache 给子路由统一设置 Cache-Control。
@@ -219,8 +231,22 @@ func (s *Server) handleReadme(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	// 结果缓存：正常 15s，异常只缓存 5s（Qdrant 恢复后要能马上显示已连接）
+	ttl := 15 * time.Second
+	if s.healthBody != nil && s.healthQdOK == false {
+		ttl = 5 * time.Second
+	}
+	s.healthMu.Lock()
+	if time.Since(s.healthAt) < ttl && s.healthBody != nil {
+		body := s.healthBody
+		s.healthMu.Unlock()
+		writeJSON(w, 200, body)
+		return
+	}
+	s.healthMu.Unlock()
+
 	qdOK := true
-	if err := s.st.QDEnsure(); err != nil {
+	if err := s.st.QDPing(); err != nil {
 		qdOK = false
 	}
 	models := map[string]bool{}
@@ -228,15 +254,21 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		_, err := os.Stat(filepath.Join(s.cfg.ModelsDir, f))
 		models[f] = err == nil
 	}
-	writeJSON(w, 200, map[string]any{
+	body := map[string]any{
 		"ok":               true,
 		"qdrant":           qdOK,
 		"models":           models,
 		"face_threshold":   s.cfg.FaceThresh,
 		"cooldown_seconds": int(s.cfg.Cooldown.Seconds()),
-		"events":           len(s.st.Events()),
+		"events":           s.st.EventCount(),
 		"labels":           len(s.st.Labels()),
-	})
+	}
+	s.healthMu.Lock()
+	s.healthBody = body
+	s.healthQdOK = qdOK
+	s.healthAt = time.Now()
+	s.healthMu.Unlock()
+	writeJSON(w, 200, body)
 }
 
 // handleGeocode 公开接口：前端拿到 GPS 后实时查逆地理地址。直接用 Store 持有的 Geocoder（带本地缓存）。
@@ -312,7 +344,7 @@ func (s *Server) view(e *store.Event) eventView {
 func (s *Server) labelCounts() (map[string]int, map[string]*store.Event) {
 	counts := map[string]int{}
 	last := map[string]*store.Event{}
-	for _, e := range s.st.Events() {
+	for _, e := range s.st.EventSlice() {
 		for _, l := range s.st.LabelsFor(e) {
 			counts[l.ID]++
 			if _, ok := last[l.ID]; !ok {
@@ -402,6 +434,11 @@ func (s *Server) handleCapture(w http.ResponseWriter, r *http.Request) {
 	lat, lon := parseLatLon(r.FormValue("lat"), r.FormValue("lon"))
 	altitude := parseFloatPtr(r.FormValue("altitude"))
 	heading := parseFloatPtr(r.FormValue("heading"))
+	// 前端（/api/geocode 或本地缓存）已经解析好的地址：直接用，省掉一次逆地理编码网络往返
+	clientAddr := strings.TrimSpace(r.FormValue("address"))
+	if clientAddr != "" {
+		s.st.RememberGeo(lat, lon, clientAddr)
+	}
 
 	var vec []float32
 	if v := r.FormValue("vector"); v != "" {
@@ -484,6 +521,7 @@ func (s *Server) handleCapture(w http.ResponseWriter, r *http.Request) {
 		PlateConf:  plateConf,
 		ImagePath:  rel,
 		PersonID:   personID, // 预解析的 → Capture 内跳过重复搜索
+		Address:    clientAddr,
 		Gender:     gender,
 		AgeRange:   ageRange,
 		Glasses:    glasses,
@@ -668,29 +706,26 @@ func (s *Server) list(w http.ResponseWriter, r *http.Request, filter func(*store
 		page = 1
 	}
 	const size = 20
-	var matched []*store.Event
-	for _, e := range s.st.Events() {
-		if filter(e) {
-			matched = append(matched, e)
-		}
-	}
+	ev := s.st.EventSlice()
 	start := (page - 1) * size
-	end := start + size
-	if start > len(matched) {
-		start = len(matched)
-	}
-	if end > len(matched) {
-		end = len(matched)
-	}
-	items := []eventView{}
-	for _, e := range matched[start:end] {
-		items = append(items, s.view(e))
+	total := 0
+	items := make([]eventView, 0, size)
+	// 从新到旧扫：只构造当前页的 view，不再为全表生成对象
+	for i := len(ev) - 1; i >= 0; i-- {
+		e := ev[i]
+		if !filter(e) {
+			continue
+		}
+		if total >= start && len(items) < size {
+			items = append(items, s.view(e))
+		}
+		total++
 	}
 	writeJSON(w, 200, map[string]any{
 		"page":      page,
 		"page_size": size,
-		"total":     len(matched),
-		"has_more":  end < len(matched),
+		"total":     total,
+		"has_more":  start+len(items) < total,
 		"items":     items,
 	})
 }
@@ -782,7 +817,9 @@ func (s *Server) handleIdentities(w http.ResponseWriter, r *http.Request) {
 	const size = 20
 
 	groups := map[string]*identity{}
-	for _, e := range s.st.Events() {
+	ev := s.st.EventSlice()
+	for i := len(ev) - 1; i >= 0; i-- {
+		e := ev[i]
 		if e.Kind != kind {
 			continue
 		}
@@ -886,7 +923,8 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	persons := map[string]bool{}
 	uniquePlates := map[string]bool{}
 	labeled := 0
-	for _, e := range s.st.Events() {
+	ev := s.st.EventSlice()
+	for _, e := range ev {
 		ts := e.CapturedAt.In(loc)
 		if ts.Before(start) || !ts.Before(end) {
 			continue

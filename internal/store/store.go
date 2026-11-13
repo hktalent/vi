@@ -76,6 +76,9 @@ type Store struct {
 	labels   []*Label
 	alerts   []Alert
 	cooldown map[string]time.Time
+	// labelIdx: "kind|target" → 该身份命中的标签。把 LabelsFor 从 O(标签总数) 降到 O(1)，
+	// 事件列表/身份列表/统计每次请求都要对每条事件查一次标签，原来是最热的内层循环。
+	labelIdx map[string][]*Label
 
 	eventsF *os.File
 	alertsF *os.File
@@ -83,10 +86,10 @@ type Store struct {
 
 	// 增量 reload：记录 events.jsonl 上次加载到的字节数 + mtime，
 	// 跨进程 append 新行时，Web 进程的内存会自动追加。
-	eventsPath   string
-	eventsSize   int64
-	labelsSize   int64
-	labelsMtime  time.Time
+	eventsPath  string
+	eventsSize  int64
+	labelsSize  int64
+	labelsMtime time.Time
 }
 
 func NewStore(cfg config.Config, qd *qdrant.Qdrant, geo *geo.Geocoder) (*Store, error) {
@@ -98,6 +101,7 @@ func NewStore(cfg config.Config, qd *qdrant.Qdrant, geo *geo.Geocoder) (*Store, 
 		labelsP:    filepath.Join(cfg.DataDir, "labels.json"),
 		cooldown:   map[string]time.Time{},
 		eventsPath: evPath,
+		labelIdx:   map[string][]*Label{},
 	}
 	f, err := os.OpenFile(evPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
@@ -129,6 +133,7 @@ func NewStore(cfg config.Config, qd *qdrant.Qdrant, geo *geo.Geocoder) (*Store, 
 			json.Unmarshal(b, &s.labels)
 		}
 	}
+	s.rebuildLabelIndex()
 	alertsPath := filepath.Join(cfg.DataDir, "alerts.jsonl")
 	if b, err := os.ReadFile(alertsPath); err == nil {
 		sc := bufio.NewScanner(bytes.NewReader(b))
@@ -239,6 +244,7 @@ type CaptureInput struct {
 	PlateConf  float64
 	ImagePath  string
 	PersonID   string // 可选：API 层预解析的 personID（确定性文件名依赖它）。空则 Capture 内部解析。
+	Address    string // 可选：前端已解析好的地址（命中则跳过逆地理编码网络请求）
 	Gender     string
 	AgeRange   string
 	Glasses    string
@@ -251,13 +257,18 @@ type CaptureResult struct {
 }
 
 func (s *Store) Capture(in CaptureInput) (*CaptureResult, error) {
-	// Reverse 用原始 WGS-84 拿地址（国际服务要 WGS-84）
-	addr := s.geo.Reverse(in.Lat, in.Lon)
+	// 地址优先级：前端已解析 > 本地缓存 > 最多等 200ms 的网络解析（超时留空，后台继续解析）
+	addr := in.Address
+	if addr == "" {
+		addr = s.geo.ReverseTimeout(in.Lat, in.Lon, 200*time.Millisecond)
+	}
 	// 存进 Qdrant 的坐标转 GCJ-02（火星坐标系），国内地图显示无偏移
 	var gcjLat, gcjLon *float64
 	if in.Lat != nil && in.Lon != nil {
+		// WGS84ToGCJ02 返回 (lng, lat)，入库字段是 (Lat, Lon)：这里必须对调，
+		// 否则每条事件的经纬度都是反的（历史数据也受此影响）
 		g, l := geo.WGS84ToGCJ02(*in.Lon, *in.Lat)
-		gcjLat, gcjLon = &g, &l
+		gcjLat, gcjLon = &l, &g
 	}
 
 	var personID string
@@ -428,9 +439,12 @@ func (s *Store) ImportFace(in ImportFaceInput) (*Event, error) {
 	var gcjLat, gcjLon *float64
 	addr := ""
 	if in.Lat != nil && in.Lon != nil {
+		// 批量导入不是延迟敏感路径：这里值得等一次真实的逆地理编码（结果按街区缓存）
 		addr = s.geo.Reverse(in.Lat, in.Lon)
+		// WGS84ToGCJ02 返回 (lng, lat)，入库字段是 (Lat, Lon)：这里必须对调，
+		// 否则每条事件的经纬度都是反的（历史数据也受此影响）
 		g, l := geo.WGS84ToGCJ02(*in.Lon, *in.Lat)
-		gcjLat, gcjLon = &g, &l
+		gcjLat, gcjLon = &l, &g
 	}
 
 	if in.CapturedAt.IsZero() {
@@ -609,20 +623,33 @@ func normalizePlate(s string) string {
 // NormalizePlate 导出版。
 func NormalizePlate(s string) string { return normalizePlate(s) }
 
-// LabelsFor 返回某次采集命中的标签（按身份查标签表）。
-func (s *Store) LabelsFor(e *Event) []*Label {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	var out []*Label
+// labelKey 是标签索引的 key：kind|target。
+func labelKey(kind, target string) string { return kind + "|" + target }
+
+// rebuildLabelIndex 在已持有 s.mu 写锁（或初始化时）重建标签索引。
+func (s *Store) rebuildLabelIndex() {
+	idx := make(map[string][]*Label, len(s.labels)*2)
 	for _, l := range s.labels {
-		if l.Kind != e.Kind {
-			continue
-		}
-		if (e.Kind == "face" && l.Target == e.PersonID) ||
-			(e.Kind == "plate" && l.Target == e.PlateText) {
-			out = append(out, l)
-		}
+		k := labelKey(l.Kind, l.Target)
+		idx[k] = append(idx[k], l)
 	}
+	s.labelIdx = idx
+}
+
+// LabelsFor 返回某次采集命中的标签（按身份查索引，O(1)）。
+func (s *Store) LabelsFor(e *Event) []*Label {
+	kind, target := e.Kind, e.PersonID
+	if kind == "plate" {
+		target = e.PlateText
+	}
+	s.mu.RLock()
+	list := s.labelIdx[labelKey(kind, target)]
+	s.mu.RUnlock()
+	if len(list) == 0 {
+		return nil
+	}
+	out := make([]*Label, len(list))
+	copy(out, list)
 	return out
 }
 
@@ -636,6 +663,14 @@ func (s *Store) Labels() []*Label {
 	return out
 }
 
+// RememberGeo 把前端已解析的地址写入逆地理缓存（避免采集时再发网络请求）。
+func (s *Store) RememberGeo(lat, lon *float64, addr string) {
+	if s == nil || s.geo == nil {
+		return
+	}
+	s.geo.Remember(lat, lon, addr, "client")
+}
+
 // Reverse 把 WGS-84 经纬度做逆地理编码（带本地缓存）。
 func (s *Store) Reverse(lat, lon *float64) string {
 	if s == nil || s.geo == nil || lat == nil || lon == nil {
@@ -644,12 +679,20 @@ func (s *Store) Reverse(lat, lon *float64) string {
 	return s.geo.Reverse(lat, lon)
 }
 
-// QDEnsure 触发 Qdrant Ensure（健康检查用）。
+// QDEnsure 触发 Qdrant Ensure（启动/首次写入用，结果内部有 TTL 缓存）。
 func (s *Store) QDEnsure() error {
 	if s.qd == nil {
 		return nil
 	}
 	return s.qd.Ensure()
+}
+
+// QDPing 只探测 Qdrant 存活（健康检查用，单次请求、300ms 超时）。
+func (s *Store) QDPing() error {
+	if s.qd == nil {
+		return nil
+	}
+	return s.qd.Ping()
 }
 
 func (s *Store) saveLabels() error {
@@ -715,6 +758,8 @@ func (s *Store) addLabelLocked(name, kind, target string, beep bool) (*Label, er
 		CreatedAt: time.Now(),
 	}
 	s.labels = append(s.labels, l)
+	k := labelKey(kind, target)
+	s.labelIdx[k] = append(s.labelIdx[k], l)
 	s.mu.Unlock()
 	if err := s.saveLabels(); err != nil {
 		return nil, err
@@ -740,6 +785,7 @@ func (s *Store) DeleteLabel(id string) error {
 	for i, l := range s.labels {
 		if l.ID == id {
 			s.labels = append(s.labels[:i], s.labels[i+1:]...)
+			s.rebuildLabelIndex()
 			return s.saveLabels()
 		}
 	}
@@ -757,6 +803,35 @@ func (s *Store) Events() []*Event {
 		out[len(s.events)-1-i] = e
 	}
 	return out
+}
+
+// EventCount 返回当前事件条数（不复制数据）。
+func (s *Store) EventCount() int {
+	s.reloadEventsIfStale()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.events)
+}
+
+// EventSlice 返回事件切片的只读视图（升序，调用方不得 append/改写元素）。
+// 说明：events 只在追加与整体替换时变化，追加写的是 len 之后的空闲槽位，
+// 因此调用方持有的旧切片头（长度固定）在并发追加期间仍可安全读取。
+// 这样事件列表/统计/身份聚合不再为每次请求复制整份事件表。
+func (s *Store) EventSlice() []*Event {
+	s.reloadEventsIfStale()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.events
+}
+
+// EachEventDesc 从新到旧遍历（每个事件单独取锁读，避免在回调用里再取读锁造成死锁）。
+func (s *Store) EachEventDesc(fn func(*Event) bool) {
+	ev := s.EventSlice()
+	for i := len(ev) - 1; i >= 0; i-- {
+		if !fn(ev[i]) {
+			return
+		}
+	}
 }
 
 // reloadEventsIfStale 增量读取 events.jsonl 中自上次加载以来追加的新行。
@@ -839,6 +914,7 @@ func (s *Store) reloadLabelsIfStale() {
 	var newLabels []*Label
 	if err := json.Unmarshal(b, &newLabels); err == nil {
 		s.labels = newLabels
+		s.rebuildLabelIndex()
 	}
 	s.labelsSize = st.Size()
 	s.labelsMtime = st.ModTime()
@@ -868,6 +944,7 @@ func (s *Store) Reset() error {
 
 	s.events = nil
 	s.labels = nil
+	s.labelIdx = map[string][]*Label{}
 	s.alerts = nil
 	s.cooldown = map[string]time.Time{}
 

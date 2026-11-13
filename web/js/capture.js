@@ -15,6 +15,8 @@ const state = {
   counters: { faces: 0, plates: 0, alerts: 0, seen: 0 },
   busyFace: false,
   busyPlate: false,
+  uploadsFace: 0,
+  plateUploading: false,
   // 推理队列：多个 track 入队后串行推理（ORT WASM 不支持并发），推理完立即上传
   inferQueue: [],
   inferWorkerRunning: false,
@@ -127,6 +129,8 @@ function formData(kind, capturedAt) {
   if (geoState.heading != null && !isNaN(geoState.heading)) {
     fd.append('heading', String(geoState.heading));
   }
+  // 前端已经解析过的地址直接带给后端：后端命中即跳过逆地理编码（未命中会缓存它）
+  if (_cachedAddr) fd.append('address', _cachedAddr);
   // 主界面"输入名字"框：自动采集到人脸时把名字一起提交，后端自动打标签（留空则不打）
   if (kind === 'face') {
     const el = document.getElementById('captureName');
@@ -194,14 +198,16 @@ function ensureInferWorker() {
       // track 已消失（超过 1.5s 没被看到），跳过
       if (performance.now() - track.lastSeen > 1500) { track.inferring = false; continue; }
       try {
-        const embedding = await state.face.embed(track._snap);
+        // 对齐图只在推理时生成一次（原来每帧每张脸都要生成）
+        const snap = state.face.align(video, track.five);
+        const embedding = await state.face.embed(snap);
         track.embedding = embedding;
-        const attrs = await state.face.attributes(track._snap);
+        const attrs = await state.face.attributes(snap);
         if (attrs) track.attrs = attrs;
-        // 推理完立即上传——不卡 6s 防抖，推理本身已经 ~8s 足够冷却
+        // 推理完立即排队上传：不等待网络返回，避免整条推理队列被一次上传卡住
         if (track.embedding) {
           track.lastSent = performance.now();
-          await uploadFace(state.face.crop(video, track.box), track.embedding, track.attrs);
+          enqueueUploadFace(track);
         }
       } catch (e) {
         console.warn('face infer worker', e);
@@ -212,6 +218,24 @@ function ensureInferWorker() {
     }
     state.inferWorkerRunning = false;
   })();
+}
+
+// 人脸上传队列：最多 2 个并发在途。
+// 原来在检测循环里 await uploadFace，一次网络往返（含后端入库）会直接停掉整帧检测。
+const MAX_FACE_UPLOADS = 2;
+function enqueueUploadFace(track) {
+  if (track.uploading) return;
+  if (state.uploadsFace >= MAX_FACE_UPLOADS) return; // 在途已满：本轮跳过，下个 6s 周期再传
+  track.uploading = true;
+  state.uploadsFace++;
+  // 同步取裁剪（canvas 池轮转），随后异步编码/上传
+  const canvas = state.face.crop(video, track.box);
+  uploadFace(canvas, track.embedding, track.attrs)
+    .catch(e => console.warn('face upload', e && e.message ? e.message : e))
+    .finally(() => {
+      track.uploading = false;
+      state.uploadsFace--;
+    });
 }
 
 // 人脸循环：rAF 驱动，FaceLandmarker 每 N 帧跑一次（中间帧由 MediaPipe 跟踪器衔接）；
@@ -237,8 +261,8 @@ async function faceLoop() {
         state.faceTracks.push(track);
       }
       track.box = f.box;
+      track.five = f.five;   // 5 点关键点，推理时用于对齐
       track.lastSeen = now;
-      track._snap = f.snap;  // 最新对齐快照，供推理 worker 使用
       state.faceBoxes.push({ box: f.box, attrs: track.attrs });
 
       // 排队推理：新 track 立即入队；已有的每 3s 间隔
@@ -249,9 +273,9 @@ async function faceLoop() {
         ensureInferWorker();
       }
       // 已有 embedding 且防抖期过了：直接上传（复用已有特征，不再推理）
-      if (track.embedding && !track.inferring && now - track.lastSent > 6000) {
+      if (track.embedding && !track.inferring && !track.uploading && now - track.lastSent > 6000) {
         track.lastSent = now;
-        await uploadFace(state.face.crop(video, f.box), track.embedding, track.attrs);
+        enqueueUploadFace(track);
       }
     }
     // 清理消失的 track，上限 12 个（支持多路同时跟踪）
@@ -306,15 +330,17 @@ async function plateLoop() {
       // 会让页面打开后的前 2 分钟里所有车牌都被当成“刚上传过”而跳过
       if (last && now - last < 120000) continue;
       if (r.conf < 0.18) continue;
-      try {
-        await uploadPlate(r.crop, r.text, r.conf);
-        // 只有上传成功才记入去重表，避免一次失败后 2 分钟内不再重试
-        state.plateLast.set(key, performance.now());
-      } catch (e) {
-        // 不再静默：把识别结果和后端拒绝原因显示出来
-        console.warn('plate upload', r.text, e);
-        toast(`车牌 ${r.text} 上传失败：${e.message || e}`, 'err', 5000);
-      }
+      if (state.plateUploading) break; // 一次只传一个车牌，避免堆叠请求
+      state.plateUploading = true;
+      state.plateLast.set(key, performance.now()); // 先占位，防止同一帧内重复入队
+      uploadPlate(r.crop, r.text, r.conf)
+        .then(() => { })
+        .catch(e => {
+          state.plateLast.delete(key); // 失败放行，允许 2 分钟内重试
+          console.warn('plate upload', r.text, e);
+          toast(`车牌 ${r.text} 上传失败：${e && e.message ? e.message : e}`, 'err', 5000);
+        })
+        .finally(() => { state.plateUploading = false; });
     }
   } catch (e) {
     console.warn('plate loop', e);

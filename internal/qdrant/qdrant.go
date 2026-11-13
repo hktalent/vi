@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sync"
 	"time"
 )
 
@@ -34,7 +35,15 @@ type Qdrant struct {
 	faces  string
 	plates string
 	cli    *http.Client
+	fast   *http.Client // 健康检查/探测用短超时客户端
+
+	ensureMu  sync.Mutex
+	ensuredAt time.Time // Ensure 成功的时间（TTL 内直接返回，避免健康检查每次 4 个请求）
 }
+
+// ensureTTL Ensure 成功结果的复用窗口。集合结构不会频繁变化，
+// 每次 /api/health 都跑 2 次 GET + 2 次建索引 PUT 纯属浪费（实测 130~175ms）。
+const ensureTTL = 10 * time.Minute
 
 func NewQdrant(base, faces, plates string) *Qdrant {
 	return &Qdrant{
@@ -42,7 +51,24 @@ func NewQdrant(base, faces, plates string) *Qdrant {
 		faces:  faces,
 		plates: plates,
 		cli:    &http.Client{Timeout: 15 * time.Second},
+		// 健康探测超时不能太苛刻：Qdrant 在批量 upsert 时可能几百 ms 不响应，
+		// 300ms 会误判成"未连接"
+		fast: &http.Client{Timeout: time.Second},
 	}
+}
+
+// Ping 只发一个轻量请求确认 Qdrant 还活着（健康检查用）。
+func (q *Qdrant) Ping() error {
+	resp, err := q.fast.Get(q.base + "/collections")
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("qdrant ping: %s", resp.Status)
+	}
+	return nil
 }
 
 type Point struct {
@@ -83,7 +109,22 @@ func (q *Qdrant) do(method, path string, body any, out any) error {
 }
 
 // Ensure 保证两个集合存在。人脸用 512 维余弦向量，车牌用文本稀疏向量。
+// 成功后在 ensureTTL 内复用结果：调用方（健康检查、每次拷贝 Qdrant 前）不再重复建索引。
 func (q *Qdrant) Ensure() error {
+	q.ensureMu.Lock()
+	defer q.ensureMu.Unlock()
+	if !q.ensuredAt.IsZero() && time.Since(q.ensuredAt) < ensureTTL {
+		return nil
+	}
+	if err := q.ensureOnce(); err != nil {
+		q.ensuredAt = time.Time{} // 失败不缓存，下次重试
+		return err
+	}
+	q.ensuredAt = time.Now()
+	return nil
+}
+
+func (q *Qdrant) ensureOnce() error {
 	var res struct {
 		Result struct {
 			Status string `json:"status"`
