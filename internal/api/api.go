@@ -500,30 +500,35 @@ func (s *Server) handleCapture(w http.ResponseWriter, r *http.Request) {
 	if res.Skipped {
 		// cooldown 跳过：没有新事件，但用户输入了名字仍要挂到该身份上
 		if kind == "face" && labelName != "" && personID != "" {
-			if _, err := s.st.AddLabelForPersonID(labelName, personID, false); err != nil {
+			if _, err := s.st.AddLabelForPersonID(labelName, personID, true); err != nil {
 				log.Printf("[api] 自动打标签失败: %v", err)
 			}
 		}
 		// 图片文件是确定性命名（personID+day），已存在就保留最新版本，不删除
-		writeJSON(w, 200, map[string]any{"ok": true, "skipped": true})
+		// 冷却期内虽然不再入库，但仍要把身份命中的标签回给前端：
+		// 否则已打标签的人/车再次出现时前端收不到 alert，既不鸣叫也不提示。
+		names, beep := labelSummary(s.st.LabelsFor(&store.Event{Kind: kind, PersonID: personID, PlateText: plate}))
+		writeJSON(w, 200, map[string]any{
+			"ok":         true,
+			"skipped":    true,
+			"plate_text": plate,
+			"labels":     names,
+			"alert":      beep,
+			"alert_text": strings.Join(names, "、"),
+		})
 		return
 	}
 
-	// 自动打标签：主界面输入了名字 → 本次采集成功后直接给该身份打上
+	// 自动打标签：主界面输入了名字 → 本次采集成功后直接给该身份打上（默认鸣叫）
 	if kind == "face" && labelName != "" {
-		if _, err := s.st.AddLabel(labelName, res.Event.ID, false); err != nil {
+		if _, err := s.st.AddLabel(labelName, res.Event.ID, true); err != nil {
 			log.Printf("[api] 自动打标签失败: %v", err)
 		} else {
 			res.Labels = s.st.LabelsFor(res.Event)
 		}
 	}
 
-	names := []string{}
-	beep := false
-	for _, l := range res.Labels {
-		names = append(names, l.Name)
-		beep = beep || l.Beep
-	}
+	names, beep := labelSummary(res.Labels)
 	writeJSON(w, 200, map[string]any{
 		"ok":         true,
 		"skipped":    false,
@@ -533,6 +538,17 @@ func (s *Server) handleCapture(w http.ResponseWriter, r *http.Request) {
 		"alert":      beep,
 		"alert_text": strings.Join(names, "、"),
 	})
+}
+
+// labelSummary 把命中标签聚合为前端展示用的名字列表 + 是否需要鸣叫。
+func labelSummary(labels []*store.Label) ([]string, bool) {
+	names := make([]string, 0, len(labels))
+	beep := false
+	for _, l := range labels {
+		names = append(names, l.Name)
+		beep = beep || l.Beep
+	}
+	return names, beep
 }
 
 // verifyFaceQuality 对 Web 上传的人脸 crop 做 YuNet + 完整五官验证。

@@ -206,6 +206,17 @@ const beeper = {
   }
 };
 
+// 浏览器自动播放策略要求 AudioContext 在用户手势内创建/恢复，
+// 首次点击/按键时解锁，避免异步采集回调里第一次 beep 无声。
+function unlockBeeper() {
+  try {
+    if (!beeper.ctx) beeper.ctx = new (window.AudioContext || window.webkitAudioContext)();
+    if (beeper.ctx.state === 'suspended') beeper.ctx.resume();
+  } catch (e) { /* 忽略：不支持 WebAudio 时静默降级 */ }
+}
+window.addEventListener('pointerdown', unlockBeeper);
+window.addEventListener('keydown', unlockBeeper);
+
 function nowStamp() {
   const d = new Date();
   const p = n => String(n).padStart(2, '0');

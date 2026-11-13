@@ -11,6 +11,7 @@ const state = {
   plateBoxes: [],
   faceTracks: [],
   plateLast: new Map(),
+  alertAt: new Map(),
   counters: { faces: 0, plates: 0, alerts: 0, seen: 0 },
   busyFace: false,
   busyPlate: false,
@@ -88,16 +89,27 @@ async function addFeed(res, kind, localBlobUrl) {
 }
 
 async function handleResult(res, kind, localBlobUrl) {
-  if (!res || res.skipped) return;
+  if (!res) return;
+  if (res.alert) {
+    // 冷却期内的重复识别（后端 skipped）同样带 alert，也必须鸣叫/提示；
+    // 但按身份节流 60s，否则同一人/车一直待在画面里会每 6 秒叫一次。
+    const plateText = res.plate_text || (res.event && res.event.plate_text) || '';
+    const key = kind + '|' + (plateText || res.alert_text || '');
+    const now = performance.now();
+    if (now - (state.alertAt.get(key) || -1e9) >= 60000) {
+      state.alertAt.set(key, now);
+      state.counters.alerts++;
+      beeper.beep(2);
+      const who = kind === 'plate' ? plateText : '';
+      const addr = (res.event && res.event.address) || '';
+      toast(`<b>${esc(res.alert_text)}</b>${who ? ' · ' + esc(who) : ''}${addr ? '<br><span class="muted">' + esc(addr) + '</span>' : ''}`, 'alert', 4200);
+    }
+  }
+  // 冷却期跳过：不重复入库、不重复进实时流，但上面的鸣叫/提示已经发出
+  if (res.skipped) { updateCounters(); return; }
   state.counters.seen++;
   if (kind === 'face') state.counters.faces++; else state.counters.plates++;
   addFeed(res, kind, localBlobUrl);
-  if (res.alert) {
-    state.counters.alerts++;
-    beeper.beep(2);
-    const who = kind === 'plate' ? (res.event.plate_text || '') : '';
-    toast(`<b>${esc(res.alert_text)}</b>${who ? ' · ' + esc(who) : ''}<br><span class="muted">${esc(res.event.address || '')}</span>`, 'alert', 4200);
-  }
   updateCounters();
 }
 
